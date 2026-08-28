@@ -30,6 +30,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .get("command")
             .and_then(Value::as_str)
             .ok_or("request command is missing")?;
+        if command == "permission.resolve" {
+            write_json(&mut stdout, &bootstrap_success(id, command, &request, mode))?;
+            continue;
+        }
         match mode {
             "silent" => continue,
             "wrong-id" => {
@@ -98,7 +102,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             | "turns-invalid-reserved-block-terminal"
             | "turns-uncorrelated-reserved-result-terminal"
             | "turns-mismatched-reserved-result-terminal"
-            | "turns-unauthorized-tool" => {
+            | "turns-unauthorized-tool"
+            | "turns-permission"
+            | "resolutions"
+            | "resolutions-wrong-ack" => {
                 write_json(&mut stdout, &bootstrap_success(id, command, &request, mode))?;
                 let params = request.get("params").unwrap_or(&Value::Null);
                 let turn_id = params
@@ -243,6 +250,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     next_sequence += 1;
                 }
+                if command == "turn.start" && mode == "turns-permission" {
+                    write_turn_event(
+                        &mut stdout,
+                        next_sequence,
+                        "runtime.permission_requested",
+                        "run-1",
+                        turn_id,
+                        json!({
+                            "requestId":"permission-1",
+                            "kind":"execute",
+                            "title":"Run a command?",
+                        }),
+                    )?;
+                    next_sequence += 1;
+                }
                 if command == "turn.start"
                     && matches!(
                         mode,
@@ -380,6 +402,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     next_sequence += 1;
                 }
+                if command == "turn.start"
+                    && matches!(mode, "resolutions" | "resolutions-wrong-ack")
+                {
+                    for (event_type, payload) in [
+                        (
+                            "runtime.tool_called",
+                            json!({
+                                "callId":"call-1",
+                                "operationId":"issues.read",
+                                "input":{"id":"issue-1"},
+                            }),
+                        ),
+                        (
+                            "runtime.input_requested",
+                            json!({
+                                "requestId":"input-1",
+                                "questionSet":{
+                                    "schema":"paperclip.question_set.v1",
+                                    "questions":[{
+                                        "id":"target",
+                                        "prompt":"Which target?",
+                                        "required":true,
+                                        "answerMode":"single_select",
+                                        "options":[{"id":"first","label":"First"}],
+                                    }],
+                                },
+                            }),
+                        ),
+                    ] {
+                        write_turn_event(
+                            &mut stdout,
+                            next_sequence,
+                            event_type,
+                            "run-1",
+                            turn_id,
+                            payload,
+                        )?;
+                        next_sequence += 1;
+                    }
+                }
                 if command == "turn.cancel" && mode == "turns" {
                     write_turn_event(
                         &mut stdout,
@@ -404,6 +466,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Value {
+    if command == "permission.resolve" {
+        return json!({
+            "protocolVersion": GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
+            "id": id,
+            "ok": false,
+            "error": {
+                "code": "permission_resolution_unsupported",
+                "message": "Codex permissions are fixed by runner policy and cannot be resolved through ACPX.",
+                "retryable": false,
+            },
+        });
+    }
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
     let result = match command {
         "initialize" => json!({
@@ -448,6 +522,8 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
             "turnId": if mode == "turns-wrong-turn" { "wrong-turn" } else { params.get("turnId").and_then(Value::as_str).unwrap_or("missing") },
         }),
         "turn.cancel" => json!({"cancelled":mode != "turns-wrong-cancel"}),
+        "tool.resolve" => json!({"resolved":mode != "resolutions-wrong-ack"}),
+        "input.resolve" => json!({"resolved":true}),
         "session.close" => json!({"closed":true}),
         _ => json!({"command":command,"params":params}),
     };
