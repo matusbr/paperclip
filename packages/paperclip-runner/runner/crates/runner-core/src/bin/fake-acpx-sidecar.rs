@@ -105,7 +105,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             | "turns-unauthorized-tool"
             | "turns-permission"
             | "resolutions"
-            | "resolutions-wrong-ack" => {
+            | "resolutions-wrong-ack"
+            | "suspend"
+            | "suspend-wrong-ack"
+            | "suspend-wrong-identity"
+            | "suspend-missing-identity" => {
                 write_json(&mut stdout, &bootstrap_success(id, command, &request, mode))?;
                 let params = request.get("params").unwrap_or(&Value::Null);
                 let turn_id = params
@@ -524,6 +528,21 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
         "turn.cancel" => json!({"cancelled":mode != "turns-wrong-cancel"}),
         "tool.resolve" => json!({"resolved":mode != "resolutions-wrong-ack"}),
         "input.resolve" => json!({"resolved":true}),
+        "session.suspend" => json!({
+            "suspended":mode != "suspend-wrong-ack",
+            "identity": if mode == "suspend-missing-identity" { Value::Null } else { json!({
+                "kind": "acpx",
+                "normalizedSessionId": if mode == "suspend-wrong-identity" { "another-session" } else { "session-1" },
+                "acpxRecordId": "record-1",
+                "backendSessionId": "backend-1",
+                "agentSessionId": "agent-1",
+                "profileDigest": format!("sha256:{}", "1".repeat(64)),
+                "workspaceDigest": format!("sha256:{}", "2".repeat(64)),
+                "requestedModel": "gpt-5.6-sol",
+                "effectiveModel": "gpt-5.6-sol",
+                "permissionMode": "approve-reads",
+            })},
+        }),
         "session.close" => json!({"closed":true}),
         _ => json!({"command":command,"params":params}),
     };
