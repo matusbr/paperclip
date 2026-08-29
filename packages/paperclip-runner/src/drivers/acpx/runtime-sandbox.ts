@@ -4,8 +4,10 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   realpath,
   rename,
+  stat,
   unlink,
   type FileHandle,
 } from "node:fs/promises";
@@ -20,11 +22,15 @@ import {
 
 import { createSanitizedAcpxSpawnInput } from "./environment.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
-import type { AcpxRecoveryBinding } from "./recovery-identity.js";
+import {
+  resolveAcpxRuntimeRoot,
+  type AcpxRecoveryBinding,
+} from "./recovery-identity.js";
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MAX_SANDBOX_ENVIRONMENT_BYTES = 512 * 1024;
+const MAX_WORKSPACE_RECORD_BYTES = 64 * 1024;
 
 export interface AcpxRuntimeSandbox {
   root: string;
@@ -37,6 +43,97 @@ export interface AcpxRuntimeSandbox {
   workspaceRecordPath: string;
   launchEnvironment: Readonly<NodeJS.ProcessEnv>;
   persistedEnvironment: Readonly<NodeJS.ProcessEnv>;
+}
+
+/** Read the private workspace binding used to reopen one exact ACPX session. */
+export async function readAcpxRecoveryWorkspace(input: {
+  runtimeDirectory: string;
+  normalizedSessionId: string;
+}): Promise<string> {
+  const runtimeRoot = await resolveAcpxRuntimeRoot(
+    input.runtimeDirectory,
+    input.normalizedSessionId,
+  );
+  const namespace = dirname(runtimeRoot);
+  let physicalNamespace: string;
+  let physicalRuntimeRoot: string;
+  try {
+    const [namespaceMetadata, rootMetadata] = await Promise.all([
+      lstat(namespace),
+      lstat(runtimeRoot),
+    ]);
+    if (
+      namespaceMetadata.isSymbolicLink() ||
+      !namespaceMetadata.isDirectory() ||
+      rootMetadata.isSymbolicLink() ||
+      !rootMetadata.isDirectory()
+    ) {
+      throw new Error("invalid recovery directory");
+    }
+    [physicalNamespace, physicalRuntimeRoot] = await Promise.all([
+      realpath(namespace),
+      realpath(runtimeRoot),
+    ]);
+  } catch {
+    throw new Error("ACPX recovery runtime directory is unavailable");
+  }
+  if (!isInside(physicalNamespace, physicalRuntimeRoot)) {
+    throw new Error("ACPX recovery runtime directory escaped its namespace");
+  }
+  const recordPath = join(physicalRuntimeRoot, "workspace");
+  let handle: FileHandle;
+  try {
+    handle = await open(
+      recordPath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    );
+  } catch {
+    throw new Error("ACPX recovery workspace record is unavailable");
+  }
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (
+      !before.isFile() ||
+      before.nlink !== 1n ||
+      before.size < 2n ||
+      before.size > BigInt(MAX_WORKSPACE_RECORD_BYTES)
+    ) {
+      throw new Error("ACPX recovery workspace record is invalid");
+    }
+    const bytes = await readFile(handle);
+    const after = await handle.stat({ bigint: true });
+    if (
+      bytes.length !== Number(before.size) ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs
+    ) {
+      throw new Error("ACPX recovery workspace record changed while read");
+    }
+    const workspace = bytes.toString("utf8").replace(/\n$/, "");
+    if (!workspace || /[\u0000\r\n]/.test(workspace)) {
+      throw new Error("ACPX recovery workspace record is invalid");
+    }
+    let physicalWorkspace: string;
+    let workspaceMetadata: Awaited<ReturnType<typeof stat>>;
+    try {
+      physicalWorkspace = await realpath(workspace);
+      workspaceMetadata = await stat(physicalWorkspace);
+    } catch {
+      throw new Error("ACPX recovery workspace is unavailable");
+    }
+    if (
+      !workspaceMetadata.isDirectory() ||
+      physicalWorkspace === dirname(physicalWorkspace)
+    ) {
+      throw new Error("ACPX recovery workspace is not a non-root directory");
+    }
+    return physicalWorkspace;
+  } finally {
+    await handle.close();
+  }
 }
 
 /** Prepare the private filesystem and environment visible to an ACPX agent. */

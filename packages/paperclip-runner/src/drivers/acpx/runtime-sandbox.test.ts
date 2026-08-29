@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rm,
   stat,
@@ -15,7 +16,10 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { resolveQualifiedAcpxProfile } from "./qualified-profiles.js";
 import { createAcpxRecoveryBinding } from "./recovery-identity.js";
-import { prepareAcpxRuntimeSandbox } from "./runtime-sandbox.js";
+import {
+  prepareAcpxRuntimeSandbox,
+  readAcpxRecoveryWorkspace,
+} from "./runtime-sandbox.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -80,6 +84,12 @@ describe("ACPX runtime sandbox", () => {
       expect(await readFile(sandbox.workspaceRecordPath, "utf8")).toBe(
         `${fixture.binding.workspacePath}\n`,
       );
+      await expect(
+        readAcpxRecoveryWorkspace({
+          runtimeDirectory: join(fixture.root, "runtime"),
+          normalizedSessionId: `sandbox-${agent}`,
+        }),
+      ).resolves.toBe(fixture.binding.workspacePath);
       expect((await lstat(sandbox.root)).isSymbolicLink()).toBe(false);
       if (process.platform !== "win32") {
         expect((await stat(sandbox.root)).mode & 0o777).toBe(0o700);
@@ -150,6 +160,66 @@ describe("ACPX runtime sandbox", () => {
           agent: "codex",
         }),
       ).rejects.toThrow(/real directory|escaped/);
+    },
+  );
+
+  it("rejects a malformed workspace recovery record", async () => {
+    const fixture = await sandboxFixture("codex");
+    const sandbox = await prepareAcpxRuntimeSandbox({
+      binding: fixture.binding,
+      agent: "codex",
+    });
+    const handle = await open(sandbox.workspaceRecordPath, "a");
+    await handle.write("extra");
+    await handle.close();
+
+    await expect(
+      readAcpxRecoveryWorkspace({
+        runtimeDirectory: join(fixture.root, "runtime"),
+        normalizedSessionId: "sandbox-codex",
+      }),
+    ).rejects.toThrow("record is invalid");
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "does not follow a substituted workspace recovery record",
+    async () => {
+      const fixture = await sandboxFixture("codex");
+      const sandbox = await prepareAcpxRuntimeSandbox({
+        binding: fixture.binding,
+        agent: "codex",
+      });
+      await rm(sandbox.workspaceRecordPath);
+      await symlink(fixture.binding.workspacePath, sandbox.workspaceRecordPath);
+
+      await expect(
+        readAcpxRecoveryWorkspace({
+          runtimeDirectory: join(fixture.root, "runtime"),
+          normalizedSessionId: "sandbox-codex",
+        }),
+      ).rejects.toThrow("record is unavailable");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "does not follow a substituted recovery session directory",
+    async () => {
+      const fixture = await sandboxFixture("codex");
+      const sandbox = await prepareAcpxRuntimeSandbox({
+        binding: fixture.binding,
+        agent: "codex",
+      });
+      const outside = join(fixture.root, "outside-recovery");
+      await mkdir(outside);
+      await rm(sandbox.root, { recursive: true });
+      await symlink(outside, sandbox.root);
+
+      await expect(
+        readAcpxRecoveryWorkspace({
+          runtimeDirectory: join(fixture.root, "runtime"),
+          normalizedSessionId: "sandbox-codex",
+        }),
+      ).rejects.toThrow("runtime directory is unavailable");
     },
   );
 });
