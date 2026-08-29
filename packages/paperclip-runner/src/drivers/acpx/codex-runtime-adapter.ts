@@ -342,6 +342,15 @@ function runtimePort(
           },
         }
       : {}),
+    startTurn(input) {
+      return runtime.startTurn({
+        handle,
+        text: input.text,
+        mode: "prompt",
+        requestId: input.requestId,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+    },
     async close(input) {
       const closeError = await closeRuntimeWithin(runtime, {
         input: {
