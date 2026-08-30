@@ -121,4 +121,61 @@ describe("redactCommandText", () => {
     const output = redactCommandText(input);
     expect(() => JSON.parse(output)).not.toThrow();
   });
+
+  it("does not leave a credential suffix visible after a literal backslash (Bearer)", () => {
+    // greptile-apps P1 on PR #12530: an earlier version of this fix excluded
+    // every backslash from the value, which stops a JSON `\"` escape from
+    // being consumed but also truncates a real secret that itself contains a
+    // literal backslash (e.g. a Windows-style credential). The value class
+    // now allows a backslash unless it is immediately followed by a quote
+    // character (the lookahead `\\(?!["'])`), matching the same technique
+    // used for the equivalent server-side fix in PR #9999.
+    const input = String.raw`curl -H "Authorization: Bearer abc\def"`;
+    const output = redactCommandText(input);
+    expect(output).not.toContain("def");
+    expect(output).toBe(`curl -H "Authorization: Bearer ${REDACTED_COMMAND_TEXT_VALUE}"`);
+  });
+
+  it("does not leave a credential suffix visible after a literal backslash (env assignment)", () => {
+    // The realistic carrier for this shape is not a bearer token but a
+    // Windows-style domain credential, e.g. PASSWORD=DOMAIN\user.
+    const input = String.raw`PASSWORD=DOMAIN\admin next-cmd`;
+    const output = redactCommandText(input);
+    expect(output).not.toContain("admin");
+    expect(output).toBe(`PASSWORD=${REDACTED_COMMAND_TEXT_VALUE} next-cmd`);
+  });
+
+  it("does not leave a credential suffix visible after a literal backslash (CLI option)", () => {
+    const input = String.raw`mycli --api-key=abc\def --verbose`;
+    const output = redactCommandText(input);
+    expect(output).not.toContain("def");
+    expect(output).toBe(`mycli --api-key=${REDACTED_COMMAND_TEXT_VALUE} --verbose`);
+  });
+
+  it("still keeps the JSON-serialized Bearer case parseable when the value also has a literal backslash before the closing escaped quote", () => {
+    // Both failure modes at once: a value containing a literal backslash,
+    // serialized so the backslash sits right before the JSON escape of the
+    // closing quote. Must redact fully AND stay parseable.
+    const raw = String.raw`curl -H "Authorization: Bearer abc\def"`;
+    const input = JSON.stringify({ command: raw });
+    const output = redactCommandText(input);
+    expect(output).not.toContain("def");
+    expect(() => JSON.parse(output)).not.toThrow();
+    expect(JSON.parse(output).command).toBe(`curl -H "Authorization: Bearer ${REDACTED_COMMAND_TEXT_VALUE}"`);
+  });
+
+  it("redacts an unquoted env value containing a Windows-style path with literal backslashes", () => {
+    const input = String.raw`env TOKEN=C:\private\credential next`;
+    const output = redactCommandText(input);
+    expect(output).not.toContain("private");
+    expect(output).not.toContain("credential");
+    expect(output).toBe(`env TOKEN=${REDACTED_COMMAND_TEXT_VALUE} next`);
+  });
+
+  it("redacts a quoted env value containing a Windows-style path with literal backslashes", () => {
+    const input = String.raw`TOKEN="C:\private\credential" safe`;
+    const output = redactCommandText(input);
+    expect(output).not.toContain("private");
+    expect(output).toBe(`TOKEN="${REDACTED_COMMAND_TEXT_VALUE}" safe`);
+  });
 });
