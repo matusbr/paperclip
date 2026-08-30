@@ -1007,7 +1007,7 @@ impl CodexCommandExecutor {
                     success,
                     completed_turn_authoritative,
                     completed_turn_observed_by_process,
-                    completion_reconciles_exit: _provider_completion_reconciles_exit,
+                    completion_reconciles_exit,
                     process_generation,
                     completed_turn_process_generation,
                 } => {
@@ -1017,14 +1017,10 @@ impl CodexCommandExecutor {
                             .state
                             .as_mut()
                             .expect("Codex state remains available while polling");
-                        // The durable terminal is the authority for the run,
-                        // including after output, probes, and provider-process
-                        // recovery. The provider event should agree, but never
-                        // let ephemeral process state append a failure after a
-                        // persisted completion. Accepting a replacement turn
-                        // clears the durable fields before its exit is polled.
-                        let completion_reconciles_exit = state.completed_turn_authoritative
-                            && state.active_provider_turn_id.is_none();
+                        // The durable terminal remains the run outcome. Use the
+                        // provider's generation correlation only to decide
+                        // whether this separate session exit belongs to that
+                        // completion or is a later idle-provider failure.
                         state.lifecycle = "provider_exited".to_owned();
                         state.push_event(NormalizedProviderEvent {
                             // A completed turn remains authoritative, while the

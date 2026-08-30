@@ -190,6 +190,7 @@ pub struct CodexProvider {
     expected_shutdown: bool,
     process_generation: u64,
     completed_turn_authority: Option<CompletedTurnAuthority>,
+    completion_reconciliation_pending: bool,
     ambiguous_turn_start_pending: bool,
 }
 
@@ -255,6 +256,7 @@ impl CodexProvider {
             expected_shutdown: false,
             process_generation,
             completed_turn_authority: None,
+            completion_reconciliation_pending: false,
             ambiguous_turn_start_pending: false,
         };
         let initialized = provider.request(
@@ -363,6 +365,7 @@ impl CodexProvider {
         // probes, and process restarts are session-liveness observations; none
         // of them supersedes a completed result. Only accepting a replacement
         // turn identity revokes this authority.
+        self.completion_reconciliation_pending = false;
     }
 
     pub(crate) fn completed_turn_authority(&self) -> Option<(u64, &str)> {
@@ -393,6 +396,8 @@ impl CodexProvider {
         // Preserve the prior durable result until a replacement turn identity
         // is accepted. A rejected, ambiguous, or transport-failed attempt does
         // not prove that replacement work superseded the completed turn.
+        let prior_reconciliation_pending = self.completion_reconciliation_pending;
+        self.completion_reconciliation_pending = false;
         let prior_buffered_message_count = self.pending_messages.len();
         self.ambiguous_turn_start_pending = true;
         let result = match self.request_classified(
@@ -419,6 +424,7 @@ impl CodexProvider {
                     .all(|buffered| is_unbound_rejected_turn_diagnostic(&buffered.value));
                 if definite_rejection {
                     self.ambiguous_turn_start_pending = false;
+                    self.completion_reconciliation_pending = prior_reconciliation_pending;
                 }
                 return Err(error);
             }
@@ -484,6 +490,7 @@ impl CodexProvider {
         self.ambiguous_turn_start_pending = false;
         self.expected_shutdown = false;
         self.completed_turn_authority = None;
+        self.completion_reconciliation_pending = false;
         self.active_provider_turn_id = Some(provider_turn_id);
     }
 
@@ -522,6 +529,9 @@ impl CodexProvider {
     pub fn read_thread(&mut self) -> Result<Value, LocalRunnerError> {
         // Probing provider state does not supersede an authoritative terminal.
         // A later replacement turn must still establish its own identity.
+        // It does prove the provider remained live after that terminal, so a
+        // subsequent nonzero exit is a separate idle-session failure.
+        self.completion_reconciliation_pending = false;
         self.request(
             "thread/read",
             json!({"threadId": self.thread_id, "includeTurns": true}),
@@ -563,10 +573,13 @@ impl CodexProvider {
                         .is_some_and(|authority| {
                             authority.process_generation == self.process_generation
                         });
-                    // An authoritative terminal remains the run outcome across
-                    // idle output, probes, and provider generations. A later
-                    // accepted replacement turn clears the authority instead.
-                    let completion_reconciles_exit = completed_turn_authoritative;
+                    // A durable terminal remains the run outcome, but it only
+                    // reconciles the process generation that produced it. A
+                    // later recovered provider can fail independently while
+                    // leaving the already-recorded turn result intact.
+                    let completion_reconciles_exit = completed_turn_authoritative
+                        && completed_turn_observed_by_process
+                        && self.completion_reconciliation_pending;
                     Ok(Some(CodexProviderEvent::Exited {
                         exit_code: exit.exit_code,
                         // A clean idle exit after a terminal is healthy. A
@@ -591,6 +604,16 @@ impl CodexProvider {
             };
             parse_provider_message(&line)?
         };
+
+        if self.completed_turn_authority.is_some()
+            && self.active_provider_turn_id.is_none()
+            && message.get("method").and_then(Value::as_str) != Some("turn/completed")
+        {
+            // Output after the terminal proves the provider entered an idle
+            // liveness phase. Keep the result authoritative, but do not let it
+            // hide a later process failure.
+            self.completion_reconciliation_pending = false;
+        }
 
         match self.classify_ambiguous_turn_message(&message)? {
             AmbiguousTurnMessage::Ready => {}
@@ -794,6 +817,7 @@ impl CodexProvider {
                     process_generation: self.process_generation,
                     provider_turn_id,
                 });
+                self.completion_reconciliation_pending = true;
                 // The provider terminal is authoritative once received. Clear
                 // local request ownership and attempt courtesy responses, but
                 // a provider that already closed stdin must not turn the

@@ -364,7 +364,7 @@ fn clean_idle_provider_exit_preserves_completed_turn_success() {
 
     assert!(completion_seen);
     assert!(post_completion_output_seen);
-    assert_eq!(clean_exit, Some((true, true, true)));
+    assert_eq!(clean_exit, Some((true, true, false)));
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -456,7 +456,7 @@ fn clean_provider_exit_does_not_refail_a_completed_turn() {
 }
 
 #[test]
-fn post_completion_output_and_resumed_probe_keep_provider_exit_reconciled() {
+fn post_completion_observation_does_not_hide_same_or_resumed_process_failure() {
     let directory = temporary_directory("completion-then-nonzero-exit");
     let config = provider_config(
         &directory,
@@ -499,12 +499,8 @@ fn post_completion_output_and_resumed_probe_keep_provider_exit_reconciled() {
                 .map(|event| event.event_type),
         );
         if event_types.iter().any(|event| event == "turn.completed")
-            && event_types
-                .iter()
-                .any(|event| event == "provider.notice.recorded")
-            && event_types
-                .iter()
-                .any(|event| event == "session.reconciled")
+            && event_types.iter().any(|event| event == "provider.notice.recorded")
+            && event_types.iter().any(|event| event == "session.failed")
         {
             break;
         }
@@ -515,10 +511,10 @@ fn post_completion_output_and_resumed_probe_keep_provider_exit_reconciled() {
     assert!(event_types
         .iter()
         .any(|event| event == "provider.notice.recorded"));
-    assert!(event_types
+    assert!(!event_types
         .iter()
         .any(|event| event == "session.reconciled"));
-    assert!(!event_types.iter().any(|event| event == "session.failed"));
+    assert!(event_types.iter().any(|event| event == "session.failed"));
     assert!(!event_types.iter().any(|event| event == "turn.failed"));
     let persisted: Value = serde_json::from_slice(
         &fs::read(directory.join("codex-provider-state.json"))
@@ -531,8 +527,8 @@ fn post_completion_output_and_resumed_probe_keep_provider_exit_reconciled() {
     assert_eq!(persisted["completedTurnProcessGeneration"], 1);
 
     // A fresh process restores the durable completed turn, probes it with
-    // thread/read, and then exits nonzero. Neither the new supervised
-    // generation nor the probe supersedes the completed run outcome.
+    // thread/read, and then exits nonzero. Recovery preserves the completed
+    // run outcome, while the later idle provider failure remains visible.
     let mut recovered = CodexCommandExecutor::new(&directory);
     let mut recovered_event_types = Vec::new();
     let recovered_exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -545,24 +541,25 @@ fn post_completion_output_and_resumed_probe_keep_provider_exit_reconciled() {
         );
         if recovered_event_types
             .iter()
-            .filter(|event| event.as_str() == "session.reconciled")
-            .count()
-            >= 2
+            .any(|event| event == "session.failed")
         {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert!(!recovered_event_types
+    assert!(recovered_event_types
         .iter()
         .any(|event| event == "session.failed"));
+    assert!(!recovered_event_types
+        .iter()
+        .any(|event| event == "turn.failed"));
     assert_eq!(
         recovered_event_types
             .iter()
             .filter(|event| event.as_str() == "session.reconciled")
             .count(),
-        2,
-        "both recovery and the resumed provider exit remain reconciled by the durable completion"
+        1,
+        "recovery is reconciled once, but the resumed provider exit fails its session"
     );
     let recovered_persisted: Value = serde_json::from_slice(
         &fs::read(directory.join("codex-provider-state.json"))
@@ -628,7 +625,7 @@ fn rejected_replacement_turn_start_preserves_result_and_exit_authority() {
         }
     });
     assert!(buffered_notification_seen);
-    assert_eq!(rejected_start_exit, Some((false, true, true)));
+    assert_eq!(rejected_start_exit, Some((false, true, false)));
 
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
@@ -715,7 +712,7 @@ fn rejected_replacement_turn_start_does_not_hide_contradictory_turn_evidence() {
 }
 
 #[test]
-fn ambiguous_or_dead_replacement_start_preserves_prior_exit_authority() {
+fn ambiguous_or_dead_replacement_start_preserves_result_not_exit_authority() {
     for (label, switch) in [
         (
             "accepted-before-response",
@@ -765,8 +762,8 @@ fn ambiguous_or_dead_replacement_start_preserves_prior_exit_authority() {
         });
         assert_eq!(
             ambiguous_start_exit,
-            Some((false, true, true)),
-            "{label} must retain the completed result and reconcile the provider exit until replacement identity is accepted"
+            Some((false, true, false)),
+            "{label} must retain the completed result without hiding the provider failure"
         );
 
         fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
@@ -1011,15 +1008,12 @@ fn ambiguous_replacement_start_preserves_durable_exit_authority() {
                 .into_iter()
                 .map(|event| event.event_type),
         );
-        if exit_events
-            .iter()
-            .any(|event| event == "session.reconciled")
-        {
+        if exit_events.iter().any(|event| event == "session.failed") {
             break;
         }
     }
-    assert!(!exit_events.iter().any(|event| event == "session.failed"));
-    assert!(exit_events
+    assert!(exit_events.iter().any(|event| event == "session.failed"));
+    assert!(!exit_events
         .iter()
         .any(|event| event == "session.reconciled"));
 
