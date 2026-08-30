@@ -718,7 +718,7 @@ describe("managed Codex credentials", () => {
       await firstOpen;
       await vi.advanceTimersByTimeAsync(20_000);
       await rejection;
-      expect(directoryOpenAttempts).toBe(8);
+      expect(directoryOpenAttempts).toBe(1);
     },
   );
 
@@ -762,7 +762,7 @@ describe("managed Codex credentials", () => {
         environment: { OPENAI_API_KEY: "launch-only-key" },
       });
       const rejection = expect(staging).rejects.toThrow(
-        "remained non-durable after 8 attempts",
+        "remained non-durable after 1 attempt",
       );
       await firstSync;
       await vi.advanceTimersByTimeAsync(20_000);
@@ -823,17 +823,20 @@ describe("managed Codex credentials", () => {
         agentHomeDirectory: fixture.home,
         environment: { OPENAI_API_KEY: "launch-only-key" },
       });
-      await firstClose;
-      await vi.advanceTimersByTimeAsync(20_000);
-      const lease = await staging;
-
-      await expect(lease.close()).rejects.toThrow(
+      const rejection = expect(staging).rejects.toThrow(
         "remained non-durable after 1 attempt",
       );
+      await firstClose;
+      await vi.advanceTimersByTimeAsync(20_000);
+      await rejection;
       expect(directoryCloseAttempts).toBe(1);
 
       settleFirstClose();
       await vi.advanceTimersByTimeAsync(20_000);
+      const lease = await freshCredentials.stageManagedCodexCredential({
+        agentHomeDirectory: fixture.home,
+        environment: { OPENAI_API_KEY: "launch-only-key" },
+      });
       await expect(lease.close()).resolves.toBeUndefined();
       expect(directoryCloseAttempts).toBeGreaterThan(1);
     },
