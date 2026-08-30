@@ -707,7 +707,15 @@ function commandLease(
           },
         );
         if (guarded) {
-          protectProviderGroupKill(child);
+          const guardianOwnerPipe = child.stdio[
+            providerOwnershipFd - 1
+          ] as Writable | null;
+          if (guardianOwnerPipe === null) {
+            throw new Error(
+              "ACPX provider lifetime guardian omitted its owner pipe",
+            );
+          }
+          protectProviderGroupKill(child, guardianOwnerPipe);
           const guardianPid = child.pid!;
           const ownership = Promise.all([
             providerOwnershipHandshake(child, providerOwnershipFd),
@@ -744,13 +752,10 @@ function commandLease(
   };
 }
 
-function protectProviderGroupKill(child: ChildProcess): void {
-  const processGroupId = child.pid;
-  if (!Number.isSafeInteger(processGroupId) || (processGroupId ?? 0) <= 0) {
-    throw new Error(
-      "ACPX provider lifetime guardian omitted its group identity",
-    );
-  }
+function protectProviderGroupKill(
+  child: ChildProcess,
+  guardianOwnerPipe: Writable,
+): void {
   const signalGuardian = child.kill.bind(child);
   let groupReaped = false;
   child.kill = (signal?: NodeJS.Signals | number): boolean => {
@@ -758,19 +763,13 @@ function protectProviderGroupKill(child: ChildProcess): void {
       return signalGuardian(signal);
     }
     if (groupReaped) return false;
-    try {
-      // The live sentinel pins this PGID. ACPX may request an emergency KILL,
-      // but it must never kill only the fence owner or signal a reused group.
-      process.kill(-(processGroupId as number), "SIGKILL");
-      groupReaped = true;
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-        groupReaped = true;
-        return false;
-      }
-      throw error;
-    }
+    groupReaped = true;
+    // Revocation closes the retained parent-to-guardian owner pipe. A live
+    // guardian receives EOF and atomically reaps its own still-pinned process
+    // group; a dead guardian cannot turn this close into a signal to a reused
+    // numeric PID or PGID. The provider also observes guardian-pipe EOF.
+    guardianOwnerPipe.destroy();
+    return true;
   };
 }
 
