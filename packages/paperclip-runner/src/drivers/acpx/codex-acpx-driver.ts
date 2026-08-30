@@ -1,0 +1,1356 @@
+import { createHash, randomBytes } from "node:crypto";
+
+import type { AcpRuntimeEvent } from "acpx/runtime";
+
+import {
+  PRP_BLOCK_TOOL_NAME,
+  PRP_COMPLETION_TOOL_NAME,
+} from "../../contracts/completion-result.js";
+import {
+  HarnessCapabilityUnavailableError,
+  HarnessStaleTurnError,
+  type HarnessDriver,
+  type HarnessDriverConfigValidation,
+  type HarnessDriverDescriptor,
+  type HarnessSession,
+  type HarnessTranscriptSnapshot,
+  type OpenHarnessSessionInput,
+  type PersistedHarnessSession,
+} from "../../contracts/harness-driver.js";
+import type { NativeAcpxPermissionMode } from "../../contracts/native-execution.js";
+import type { NativeUserMessage } from "../../contracts/types.js";
+import type {
+  PrpEvent,
+  PrpStructuredRunResult,
+} from "../../protocol/replay-contract.js";
+import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
+import {
+  canonicalProviderEventsFromAcpxRuntimeEvent,
+  createAcpxToolEventNormalizer,
+} from "../../provider-events.js";
+import {
+  canonicalRunnerToolName,
+  type RunnerToolCall,
+} from "../runner-tool-bridge.js";
+import {
+  DEFAULT_CODEX_ACPX_RUNTIME_SHUTDOWN_BOUND_MS,
+  openCodexAcpxRuntime,
+} from "./codex-runtime-adapter.js";
+import {
+  acpxDriverDescriptor,
+  validateAcpxDriverConfig,
+} from "./driver-profile.js";
+import {
+  ACPX_TURN_CANCELLATION_SHUTDOWN_BOUND_MS,
+  AcpxRuntimeHost,
+  type AcpxRuntimeTurn,
+  type OpenAcpxRuntimeHostOptions,
+} from "./runtime-host.js";
+
+const MAX_BUFFERED_EVENTS = 512;
+const TERMINAL_EVENT_RESERVE = 3;
+const TURN_START_EVENT_COUNT = 3;
+const MAX_TRANSCRIPT_EVENTS = 1_024;
+const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+const CLOSE_TURN_SETTLEMENT_TIMEOUT_MS = 2_000;
+const MAX_AUTONOMOUS_HOST_CLOSE_RETRIES = 3;
+const MAX_QUARANTINED_HOST_CLOSE_RETRIES = 3;
+const QUARANTINED_HOST_CLOSE_RETRY_MS = 60_000;
+const MAX_QUARANTINED_HOST_ATTEMPT_RETRY_DELAY_MS = 1_000;
+// Host shutdown first bounds active-turn cancellation and then performs the
+// adapter's bounded protocol/TERM/KILL cleanup. Bound each ownership phase that
+// admission observes: an inherited owner may install a distinct replacement
+// recovery, which receives its own finite grace rather than inheriting an
+// almost-expired deadline. Cover every attempt and bounded inter-attempt delay,
+// plus one second of scheduling margin.
+const QUARANTINED_HOST_CLOSE_ATTEMPT_BOUND_MS =
+  ACPX_TURN_CANCELLATION_SHUTDOWN_BOUND_MS +
+  DEFAULT_CODEX_ACPX_RUNTIME_SHUTDOWN_BOUND_MS;
+const MAX_INHERITED_QUARANTINED_HOST_CLOSE_ATTEMPTS = 1;
+const QUARANTINED_HOST_ADMISSION_GRACE_MS =
+  (MAX_INHERITED_QUARANTINED_HOST_CLOSE_ATTEMPTS +
+    MAX_QUARANTINED_HOST_CLOSE_RETRIES) *
+    QUARANTINED_HOST_CLOSE_ATTEMPT_BOUND_MS +
+  (MAX_QUARANTINED_HOST_CLOSE_RETRIES - 1) *
+    MAX_QUARANTINED_HOST_ATTEMPT_RETRY_DELAY_MS +
+  1_000;
+
+export interface CodexAcpxDynamicToolCall {
+  tool: string;
+  callId: string;
+  providerSessionId: string;
+  turnId: string;
+  arguments: unknown;
+  signal: AbortSignal;
+}
+
+export interface CodexAcpxDriverOptions {
+  runtimeDirectory: string;
+  model: string;
+  permissionMode?: NativeAcpxPermissionMode;
+  systemInstructions?: string;
+  environment?: NodeJS.ProcessEnv;
+  managedCodexCredentialSourcePath?: string;
+  dynamicTools?: readonly Readonly<Record<string, unknown>>[];
+  dynamicToolHandler?: (call: CodexAcpxDynamicToolCall) => Promise<unknown>;
+  now?: () => Date;
+}
+
+interface CodexAcpxHost {
+  identity(): ReturnType<AcpxRuntimeHost["identity"]>;
+  binding(): ReturnType<AcpxRuntimeHost["binding"]>;
+  status(): ReturnType<AcpxRuntimeHost["status"]>;
+  startTurn(
+    input: Parameters<AcpxRuntimeHost["startTurn"]>[0],
+  ): AcpxRuntimeTurn;
+  interruptActiveTurn(reason: string): Promise<void>;
+  close(input: { reason: string }): Promise<void>;
+}
+
+interface QuarantinedHostCleanup {
+  host: CodexAcpxHost;
+  reason: string;
+  attempt: Promise<void> | null;
+  recovery: Promise<void> | null;
+  recoveryMaxAttempts: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+export interface CodexAcpxDriverDependencies {
+  openHost?: (options: OpenAcpxRuntimeHostOptions) => Promise<CodexAcpxHost>;
+  /** Internal test seam; production uses the fixed close-settlement bound. */
+  closeSettlementTimeoutMs?: number;
+  /** Internal test seam; production uses the fixed event-retention bound. */
+  maxBufferedEvents?: number;
+  /** Internal test seam; production reserves fixed terminal-event capacity. */
+  terminalEventReserve?: number;
+}
+
+/** Codex-only HarnessDriver backed by the admitted ACPX runtime host. */
+export class CodexAcpxDriver implements HarnessDriver {
+  readonly #options: CodexAcpxDriverOptions;
+  readonly #openHost: NonNullable<CodexAcpxDriverDependencies["openHost"]>;
+  readonly #closeSettlementTimeoutMs: number;
+  readonly #maxBufferedEvents: number;
+  readonly #terminalEventReserve: number;
+  readonly #cleanupOwners = new Set<Promise<void>>();
+  readonly #quarantinedHostCleanups = new Set<QuarantinedHostCleanup>();
+
+  constructor(
+    options: CodexAcpxDriverOptions,
+    dependencies: CodexAcpxDriverDependencies = {},
+  ) {
+    this.#options = {
+      ...options,
+      ...(options.environment
+        ? { environment: { ...options.environment } }
+        : {}),
+      ...(options.dynamicTools
+        ? { dynamicTools: structuredClone(options.dynamicTools) }
+        : {}),
+    };
+    this.#openHost =
+      dependencies.openHost ??
+      ((hostOptions) =>
+        AcpxRuntimeHost.open(hostOptions, {
+          openRuntime: openCodexAcpxRuntime,
+        }));
+    this.#closeSettlementTimeoutMs =
+      dependencies.closeSettlementTimeoutMs ?? CLOSE_TURN_SETTLEMENT_TIMEOUT_MS;
+    this.#terminalEventReserve = Math.max(
+      0,
+      Math.floor(dependencies.terminalEventReserve ?? TERMINAL_EVENT_RESERVE),
+    );
+    this.#maxBufferedEvents = Math.max(
+      this.#terminalEventReserve + TURN_START_EVENT_COUNT,
+      Math.floor(dependencies.maxBufferedEvents ?? MAX_BUFFERED_EVENTS),
+    );
+  }
+
+  async descriptor(): Promise<HarnessDriverDescriptor> {
+    const descriptor = acpxDriverDescriptor("codex");
+    return {
+      ...descriptor,
+      displayName: "Codex via ACPX",
+      runtimeContextCapabilities: {
+        instructions: "native",
+        skills: "unsupported",
+        mcp: "native",
+      },
+      capabilities: {
+        ...descriptor.capabilities,
+        resume: false,
+        runtimeRequestResolution: false,
+        runtimeRequestHandoff: false,
+        unsupported: [
+          "resume",
+          "steering",
+          "runtimeRequestResolution",
+          "runtimeRequestHandoff",
+          "goals",
+          "threadLineage",
+        ],
+      },
+    };
+  }
+
+  async validateConfig(value: unknown): Promise<HarnessDriverConfigValidation> {
+    const validation = validateAcpxDriverConfig(value);
+    if (!validation.ok || validation.config.agent === "codex")
+      return validation;
+    return {
+      ok: false,
+      config: null,
+      issues: [
+        {
+          path: "agent",
+          code: "unsupported_agent",
+          message: "The production ACPX driver currently supports Codex only.",
+        },
+      ],
+    };
+  }
+
+  async openSession(input: OpenHarnessSessionInput): Promise<HarnessSession> {
+    await runAbortableDriverAdmission(
+      input.signal,
+      () => this.#retryQuarantinedHostCleanups(),
+    );
+    let session: CodexAcpxSession | null = null;
+    const host = await this.#openHostForAdmission({
+      runtimeDirectory: this.#options.runtimeDirectory,
+      normalizedSessionId: input.normalizedSessionId,
+      workingDirectory: input.workingDirectory,
+      agent: "codex",
+      model: this.#options.model,
+      permissionMode: this.#options.permissionMode ?? "approve-reads",
+      systemInstructions: this.#options.systemInstructions,
+      environment: this.#options.environment,
+      managedCodexCredentialSourcePath:
+        this.#options.managedCodexCredentialSourcePath,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      semanticTools: {
+        tools: this.#options.dynamicTools ?? [],
+        handler: (call) => {
+          if (!session) {
+            throw new Error("Codex ACPX session is not ready for tool calls");
+          }
+          return session.dispatchTool(call);
+        },
+      },
+    }, input.signal);
+    try {
+      input.signal?.throwIfAborted();
+      session = new CodexAcpxSession({
+        host,
+        input,
+        dynamicToolHandler: this.#options.dynamicToolHandler,
+        now: this.#options.now ?? (() => new Date()),
+        closeSettlementTimeoutMs: this.#closeSettlementTimeoutMs,
+        maxBufferedEvents: this.#maxBufferedEvents,
+        terminalEventReserve: this.#terminalEventReserve,
+        retainCleanup: (cleanup) => this.#retainCleanup(cleanup),
+        quarantineCleanup: (hostToRetain, reason) =>
+          this.#quarantineHostCleanup(hostToRetain, reason),
+      });
+      return session;
+    } catch (error) {
+      const reason = "Codex ACPX session initialization failed";
+      const cleanup = Promise.resolve().then(() => host.close({ reason }));
+      this.#retainCleanup(cleanup);
+      void cleanup.catch(() => this.#quarantineHostCleanup(host, reason));
+      await settleWithin(cleanup, this.#closeSettlementTimeoutMs).catch(
+        () => undefined,
+      );
+      throw error;
+    }
+  }
+
+  async #openHostForAdmission(
+    options: OpenAcpxRuntimeHostOptions,
+    signal: AbortSignal | undefined,
+  ): Promise<CodexAcpxHost> {
+    if (signal === undefined) return await this.#openHost(options);
+    signal.throwIfAborted();
+    const opening = Promise.resolve().then(() => this.#openHost(options));
+    try {
+      return await raceDriverAdmissionWithAbort(opening, signal);
+    } catch (error) {
+      if (signal.aborted) {
+        const lateHostCleanup = opening.then(
+          (host) => this.#closeLateAdmissionHost(host),
+          () => undefined,
+        );
+        this.#retainCleanup(lateHostCleanup);
+      }
+      throw error;
+    }
+  }
+
+  async #closeLateAdmissionHost(host: CodexAcpxHost): Promise<void> {
+    const reason = "Codex ACPX host resolved after admission was aborted";
+    const cleanup = Promise.resolve().then(() => host.close({ reason }));
+    this.#retainCleanup(cleanup);
+    try {
+      await cleanup;
+    } catch {
+      this.#quarantineHostCleanup(host, reason);
+    }
+  }
+
+  #retainCleanup(cleanup: Promise<void>): void {
+    this.#cleanupOwners.add(cleanup);
+    void cleanup
+      .finally(() => this.#cleanupOwners.delete(cleanup))
+      .catch(() => undefined);
+  }
+
+  #quarantineHostCleanup(host: CodexAcpxHost, reason: string): void {
+    if ([...this.#quarantinedHostCleanups].some((entry) => entry.host === host)) {
+      return;
+    }
+    const cleanup: QuarantinedHostCleanup = {
+      host,
+      reason,
+      attempt: null,
+      recovery: null,
+      recoveryMaxAttempts: null,
+      timer: null,
+    };
+    this.#quarantinedHostCleanups.add(cleanup);
+    this.#startQuarantinedHostCleanupRecovery(
+      cleanup,
+      MAX_QUARANTINED_HOST_CLOSE_RETRIES,
+      "quarantined cleanup recovery",
+    );
+  }
+
+  #startQuarantinedHostCleanupRecovery(
+    cleanup: QuarantinedHostCleanup,
+    maxAttempts: number,
+    reason: string,
+  ): Promise<void> {
+    if (cleanup.recovery) return cleanup.recovery;
+    const recovery = (async () => {
+      for (
+        let attemptCount = 0;
+        attemptCount < maxAttempts && this.#quarantinedHostCleanups.has(cleanup);
+        attemptCount += 1
+      ) {
+        // Start the first retry immediately so admission's finite grace applies
+        // to provider cleanup rather than to this rate-limit delay. Only later
+        // attempts wait, preserving sequential bounded retry behavior.
+        if (attemptCount > 0) {
+          await waitForCleanupRetry(
+            Math.max(
+              1,
+              Math.min(
+                MAX_QUARANTINED_HOST_ATTEMPT_RETRY_DELAY_MS,
+                this.#closeSettlementTimeoutMs,
+              ),
+            ),
+          );
+        }
+        const attempt = Promise.resolve().then(() => cleanup.host.close({
+          reason: `${cleanup.reason} (${reason})`,
+        }));
+        cleanup.attempt = attempt;
+        try {
+          await attempt;
+          this.#quarantinedHostCleanups.delete(cleanup);
+        } catch {
+          // Retain the quarantine after this finite, sequential retry batch.
+        } finally {
+          if (cleanup.attempt === attempt) cleanup.attempt = null;
+        }
+      }
+    })();
+    cleanup.recovery = recovery;
+    cleanup.recoveryMaxAttempts = maxAttempts;
+    this.#retainCleanup(recovery);
+    void recovery.finally(() => {
+      if (cleanup.recovery === recovery) {
+        cleanup.recovery = null;
+        cleanup.recoveryMaxAttempts = null;
+      }
+      this.#scheduleQuarantinedHostCleanup(cleanup);
+    }).catch(() => undefined);
+    return recovery;
+  }
+
+  #scheduleQuarantinedHostCleanup(cleanup: QuarantinedHostCleanup): void {
+    if (
+      !this.#quarantinedHostCleanups.has(cleanup)
+      || cleanup.recovery
+      || cleanup.attempt
+      || cleanup.timer
+    ) {
+      return;
+    }
+    // A quarantined host remains actively owned, but recovery is rate-limited:
+    // each entry holds at most one unref'd timer and one sequential close.
+    // Admission may pull that timer forward; it never creates a parallel try.
+    cleanup.timer = setTimeout(() => {
+      cleanup.timer = null;
+      if (!this.#quarantinedHostCleanups.has(cleanup)) return;
+      this.#startQuarantinedHostCleanupRecovery(
+        cleanup,
+        1,
+        "scheduled quarantined cleanup recovery",
+      );
+    }, QUARANTINED_HOST_CLOSE_RETRY_MS);
+    cleanup.timer.unref?.();
+  }
+
+  async #retryQuarantinedHostCleanups(): Promise<void> {
+    const observedOwners = new Set<Promise<void>>();
+    const acceleratedCleanups = new Set<QuarantinedHostCleanup>();
+    while (true) {
+      // A close that is still pending has not entered quarantine yet, but it
+      // owns the same provider resources. Observe every retained owner and any
+      // replacement quarantine recovery it installs before admitting a host.
+      const cleanupOwners = new Set<Promise<void>>(this.#cleanupOwners);
+      for (const cleanup of this.#quarantinedHostCleanups) {
+        if (cleanup.timer) {
+          clearTimeout(cleanup.timer);
+          cleanup.timer = null;
+        }
+        if (cleanup.recovery) {
+          // A scheduled autonomous owner has only one attempt. Admission
+          // observes it first, then starts one complete bounded batch if that
+          // attempt fails. A pre-existing full batch already consumed that
+          // allowance and must never be duplicated.
+          if (
+            (cleanup.recoveryMaxAttempts ?? 0)
+              >= MAX_QUARANTINED_HOST_CLOSE_RETRIES
+          ) {
+            acceleratedCleanups.add(cleanup);
+          }
+          cleanupOwners.add(cleanup.recovery);
+        } else if (!acceleratedCleanups.has(cleanup)) {
+          acceleratedCleanups.add(cleanup);
+          cleanupOwners.add(this.#startQuarantinedHostCleanupRecovery(
+            cleanup,
+            MAX_QUARANTINED_HOST_CLOSE_RETRIES,
+            "quarantined cleanup admission recovery",
+          ));
+        }
+      }
+      const replacementOwners = [...cleanupOwners].filter(
+        (owner) => !observedOwners.has(owner),
+      );
+      if (replacementOwners.length === 0) break;
+      replacementOwners.forEach((owner) => observedOwners.add(owner));
+      if (
+        !(await settlesWithin(
+          Promise.all(replacementOwners.map((owner) => owner.catch(() => undefined))),
+          QUARANTINED_HOST_ADMISSION_GRACE_MS,
+        ))
+      ) {
+        throw new Error(
+          "Codex ACPX cannot open a new session because quarantined host cleanup exceeded the admission grace",
+        );
+      }
+    }
+    if (this.#cleanupOwners.size > 0 || this.#quarantinedHostCleanups.size > 0) {
+      // A failed admission-observed batch must hand cleanup back to the
+      // autonomous timer before admission rejects. Otherwise the quarantined
+      // host remains dormant until an unrelated later admission.
+      for (const cleanup of this.#quarantinedHostCleanups) {
+        this.#scheduleQuarantinedHostCleanup(cleanup);
+      }
+      throw new Error(
+        "Codex ACPX cannot open a new session while quarantined host cleanup remains incomplete",
+      );
+    }
+  }
+}
+
+class CodexAcpxSession implements HarnessSession {
+  readonly #host: CodexAcpxHost;
+  readonly #input: OpenHarnessSessionInput;
+  readonly #dynamicToolHandler?: CodexAcpxDriverOptions["dynamicToolHandler"];
+  readonly #now: () => Date;
+  readonly #closeSettlementTimeoutMs: number;
+  readonly #maxBufferedEvents: number;
+  readonly #terminalEventReserve: number;
+  readonly #events: AsyncQueue<PrpEvent>;
+  readonly #retainCleanup: (cleanup: Promise<void>) => void;
+  readonly #quarantineCleanup: (host: CodexAcpxHost, reason: string) => void;
+  readonly #transcript: Array<{ event: PrpEvent; bytes: number }> = [];
+  readonly #terminalTurns = new Map<string, string>();
+  readonly #sourceInstanceId: string;
+  #sourceSequence = 0;
+  #activeTurnId: string | null = null;
+  #semanticResult: PrpStructuredRunResult | null = null;
+  #semanticFingerprint: string | null = null;
+  #semanticCallId: string | null = null;
+  #semanticTurnId: string | null = null;
+  #usage: Record<string, unknown> | null = null;
+  #assistantText = "";
+  #closed = false;
+  #closingStarted = false;
+  #eventStreamClosed = false;
+  #activePump: Promise<void> | null = null;
+  #closePromise: Promise<void> | null = null;
+  #hostClosePromise: Promise<void> | null = null;
+  #hostCloseRecoveryPromise: Promise<void> | null = null;
+  #hostClosed = false;
+  #transcriptBytes = 0;
+  #transcriptEventCount = 0;
+  #transcriptOmitted = false;
+  #eventStreamOmitted = false;
+  #pendingTerminal: {
+    turnId: string;
+    fingerprint: string;
+    eventType: "turn.completed" | "turn.failed" | "turn.interrupted";
+    payload: Record<string, unknown>;
+  } | null = null;
+
+  constructor(input: {
+    host: CodexAcpxHost;
+    input: OpenHarnessSessionInput;
+    dynamicToolHandler?: CodexAcpxDriverOptions["dynamicToolHandler"];
+    now: () => Date;
+    closeSettlementTimeoutMs: number;
+    maxBufferedEvents: number;
+    terminalEventReserve: number;
+    retainCleanup: (cleanup: Promise<void>) => void;
+    quarantineCleanup: (host: CodexAcpxHost, reason: string) => void;
+  }) {
+    const identity = input.host.identity();
+    if (identity.normalizedSessionId !== input.input.normalizedSessionId) {
+      throw new Error("Codex ACPX host returned a different session identity");
+    }
+    this.#host = input.host;
+    this.#input = structuredClone(input.input);
+    this.#dynamicToolHandler = input.dynamicToolHandler;
+    this.#now = input.now;
+    this.#closeSettlementTimeoutMs = input.closeSettlementTimeoutMs;
+    this.#maxBufferedEvents = input.maxBufferedEvents;
+    this.#terminalEventReserve = input.terminalEventReserve;
+    this.#retainCleanup = input.retainCleanup;
+    this.#quarantineCleanup = input.quarantineCleanup;
+    this.#events = new AsyncQueue<PrpEvent>(input.maxBufferedEvents);
+    this.#sourceInstanceId = stableId(
+      "paperclip-acpx",
+      input.input.normalizedSessionId,
+    );
+  }
+
+  ids() {
+    const identity = this.#host.identity();
+    return {
+      driverSessionId: identity.acpxRecordId,
+      providerSessionId: identity.agentSessionId,
+      displayId: identity.agentSessionId,
+    };
+  }
+
+  events(): AsyncIterable<PrpEvent> {
+    return this.#events;
+  }
+
+  async startTurn(input: {
+    message: NativeUserMessage;
+  }): Promise<{ turnId: string }> {
+    this.#assertOpen();
+    if (this.#activeTurnId) {
+      throw new Error("Codex ACPX session already has an active turn");
+    }
+    if (
+      !this.#events.hasCapacity(
+        this.#terminalEventReserve + TURN_START_EVENT_COUNT,
+      )
+    ) {
+      throw new HarnessCapabilityUnavailableError(
+        "turn.start",
+        "the event consumer must drain the previous turn before another turn can start",
+      );
+    }
+    if (this.#terminalTurns.size >= this.#maxBufferedEvents) {
+      throw new HarnessCapabilityUnavailableError(
+        "turn.start",
+        "the bounded session turn limit was reached; open a new session",
+      );
+    }
+    const turnId = `turn-${randomBytes(12).toString("hex")}`;
+    this.#activeTurnId = turnId;
+    this.#assistantText = "";
+    this.#emit("turn.submitted", { text: input.message.text }, { turnId });
+    this.#emit("turn.accepted", { turnId }, { turnId });
+    this.#emit("turn.started", { status: "inProgress" }, { turnId });
+    let turn: AcpxRuntimeTurn;
+    try {
+      turn = this.#host.startTurn({
+        text: input.message.text,
+        requestId: `${safeId(this.#input.runId, "run")}:${turnId}`,
+      });
+    } catch (error) {
+      this.#publishTerminal(
+        turnId,
+        canonicalJson({ status: "failed" }),
+        "turn.failed",
+        { status: "failed", error: { message: safeMessage(error) } },
+      );
+      throw error;
+    }
+    const pump = this.#pumpTurn(turnId, turn);
+    this.#activePump = pump;
+    void pump
+      .finally(() => {
+        if (this.#activePump === pump) this.#activePump = null;
+      })
+      .catch(() => undefined);
+    return { turnId };
+  }
+
+  async interrupt(input: { turnId?: string; reason?: string }): Promise<void> {
+    this.#assertOpen();
+    if (input.turnId && input.turnId !== this.#activeTurnId) {
+      throw new HarnessStaleTurnError(input.turnId);
+    }
+    if (this.#pendingTerminal) {
+      throw new HarnessCapabilityUnavailableError(
+        "interruption",
+        "the active turn is awaiting canonical terminal-event retention",
+      );
+    }
+    if (!this.#activeTurnId) {
+      throw new HarnessCapabilityUnavailableError(
+        "interruption",
+        "there is no active Codex ACPX turn",
+      );
+    }
+    await this.#host.interruptActiveTurn(input.reason ?? "interrupted");
+  }
+
+  async dispatchTool(call: RunnerToolCall): Promise<unknown> {
+    this.#assertOpen();
+    if (this.#pendingTerminal) {
+      throw new HarnessCapabilityUnavailableError(
+        "tool.dispatch",
+        "the active turn is awaiting canonical terminal-event retention",
+      );
+    }
+    const turnId = this.#activeTurnId;
+    if (!turnId) {
+      throw new Error("Codex ACPX tool call is not bound to an active turn");
+    }
+    const tool = canonicalRunnerToolName(call.tool);
+    if (tool === PRP_COMPLETION_TOOL_NAME || tool === PRP_BLOCK_TOOL_NAME) {
+      const validation = validatePrpStructuredRunResult(call.arguments);
+      if (!validation.ok) throw new Error("Invalid semantic run result");
+      const blocked = validation.result.reportedWorkDisposition === "blocked";
+      if (
+        (tool === PRP_BLOCK_TOOL_NAME && !blocked) ||
+        (tool === PRP_COMPLETION_TOOL_NAME && blocked)
+      ) {
+        throw new Error(
+          "Semantic result disposition does not match the terminal tool",
+        );
+      }
+      const fingerprint = canonicalJson(validation.result);
+      if (
+        this.#semanticFingerprint !== null &&
+        this.#semanticFingerprint !== fingerprint
+      ) {
+        throw new Error("A different semantic result is already committed");
+      }
+      if (this.#semanticFingerprint === null) {
+        if (!this.#emit("run.result.proposed", validation.result, {
+          turnId,
+          itemId: call.callId,
+        })) {
+          throw new HarnessCapabilityUnavailableError(
+            "run.result.proposed",
+            "the event consumer must drain provider events before a semantic result can be accepted",
+          );
+        }
+        this.#semanticResult = structuredClone(validation.result);
+        this.#semanticFingerprint = fingerprint;
+        this.#semanticCallId = call.callId;
+        this.#semanticTurnId = turnId;
+      }
+      return { accepted: true };
+    }
+    if (!this.#dynamicToolHandler) {
+      throw new Error(`Unsupported Paperclip operation ${tool}`);
+    }
+    return await this.#dynamicToolHandler({
+      tool,
+      callId: call.callId,
+      providerSessionId: this.#host.identity().agentSessionId,
+      turnId,
+      arguments: structuredClone(call.arguments),
+      signal: call.signal,
+    });
+  }
+
+  async read(): Promise<Record<string, unknown>> {
+    return {
+      identity: this.#host.identity(),
+      binding: this.#host.binding(),
+      status: await this.#host.status(),
+    };
+  }
+
+  async reconcile(): Promise<Record<string, unknown>> {
+    const identity = this.#host.identity();
+    const status = await this.#host.status();
+    if (
+      status.agentSessionId &&
+      status.agentSessionId !== identity.agentSessionId
+    ) {
+      throw new Error("ACPX reconciliation changed the provider session");
+    }
+    return { identity, status };
+  }
+
+  async usage(): Promise<Record<string, unknown> | null> {
+    return this.#usage === null ? null : structuredClone(this.#usage);
+  }
+
+  async transcript(): Promise<HarnessTranscriptSnapshot> {
+    return {
+      schema: "paperclip-runner/harness-transcript/v1",
+      complete: !this.#transcriptOmitted,
+      eventCount: this.#transcriptEventCount,
+      events: structuredClone(this.#transcript.map(({ event }) => event)),
+      omissionReason: this.#transcriptOmitted ? "retention_limit" : null,
+    };
+  }
+
+  async snapshot(): Promise<PersistedHarnessSession> {
+    const identity = this.#host.identity();
+    return {
+      driverKind: "acpx_runtime",
+      driverSessionId: identity.acpxRecordId,
+      providerSessionId: identity.agentSessionId,
+      runId: this.#input.runId,
+      normalizedSessionId: this.#input.normalizedSessionId,
+      activeTurnId: this.#activeTurnId,
+      lastSourceSequence: this.#sourceSequence,
+      providerIdentity: {
+        kind: "acpx",
+        normalizedSessionId: identity.normalizedSessionId,
+        acpxRecordId: identity.acpxRecordId,
+        backendSessionId: identity.backendSessionId,
+        agentSessionId: identity.agentSessionId,
+        profileDigest: identity.profileDigest,
+        workspaceDigest: identity.workspaceDigest,
+        requestedModel: identity.requestedModel,
+        effectiveModel: identity.effectiveModel,
+        permissionMode: identity.permissionMode,
+      },
+      semanticResult:
+        this.#semanticResult &&
+        this.#semanticFingerprint &&
+        this.#semanticTurnId
+          ? {
+              result: structuredClone(this.#semanticResult),
+              fingerprint: this.#semanticFingerprint,
+              callId: this.#semanticCallId,
+              turnId: this.#semanticTurnId,
+            }
+          : null,
+      terminalTurns: [...this.#terminalTurns].map(
+        ([terminalTurnId, fingerprint]) => ({
+          turnId: terminalTurnId,
+          fingerprint,
+        }),
+      ),
+    };
+  }
+
+  async close(input: { reason: string }): Promise<void> {
+    if (this.#closePromise) return await this.#closePromise;
+    if (this.#closed) return;
+    this.#closingStarted = true;
+    const closePromise = this.#finishClose(input.reason);
+    this.#closePromise = closePromise;
+    try {
+      await closePromise;
+      this.#closed = true;
+    } catch (error) {
+      this.#scheduleHostCloseRecovery(input.reason);
+      throw error;
+    } finally {
+      if (this.#closePromise === closePromise) this.#closePromise = null;
+    }
+  }
+
+  async #finishClose(reason: string): Promise<void> {
+    const closingTurnId = this.#activeTurnId;
+    const pump = this.#activePump;
+    const hostClose =
+      this.#hostClosePromise ?? this.#startHostClose({ reason });
+    let hostCloseError: unknown = null;
+    try {
+      await settleWithin(hostClose, this.#closeSettlementTimeoutMs);
+    } catch (error) {
+      hostCloseError = error;
+    }
+    if (pump) {
+      await settleWithin(
+        pump.catch(() => undefined),
+        this.#closeSettlementTimeoutMs,
+      ).catch(() => undefined);
+    }
+    if (closingTurnId && !this.#terminalTurns.has(closingTurnId)) {
+      const pendingTerminal = this.#pendingTerminal;
+      if (pendingTerminal?.turnId === closingTurnId) {
+        this.#publishTerminal(
+          pendingTerminal.turnId,
+          pendingTerminal.fingerprint,
+          pendingTerminal.eventType,
+          pendingTerminal.payload,
+        );
+      } else {
+        this.#publishTerminal(
+          closingTurnId,
+          canonicalJson({ status: "interrupted" }),
+          "turn.interrupted",
+          { status: "interrupted", stopReason: "session_closed" },
+        );
+      }
+    }
+    if (hostCloseError) {
+      this.#emit(
+        "harness.diagnostic",
+        {
+          code: "acpx_host_cleanup_deferred",
+          message:
+            "ACPX host cleanup exceeded its caller wait bound; the driver retains the exact cleanup until it settles.",
+        },
+        closingTurnId ? { turnId: closingTurnId } : {},
+        0,
+      );
+    }
+    this.#eventStreamClosed = true;
+    this.#events.close();
+    if (hostCloseError) {
+      throw hostCloseError;
+    }
+  }
+
+  #startHostClose(input: { reason: string }): Promise<void> {
+    const closePromise = this.#host.close(input).then(() => {
+      this.#hostClosed = true;
+    });
+    this.#hostClosePromise = closePromise;
+    this.#retainCleanup(closePromise);
+    return closePromise;
+  }
+
+  #scheduleHostCloseRecovery(reason: string): void {
+    if (this.#hostClosed || this.#hostCloseRecoveryPromise) return;
+    const failedOrPendingClose = this.#hostClosePromise;
+    if (!failedOrPendingClose) return;
+    // Never overlap the exact cleanup that exceeded the caller's wait bound.
+    // Once an attempt rejects, keep one delay-bounded recovery owner alive for
+    // a finite retry budget. A permanently pending attempt remains the sole
+    // owner while the runtime adapter independently terminates its children;
+    // repeated terminal failures settle instead of creating an immortal loop.
+    // Host cleanup does not logically close the harness session: #finishClose
+    // still owns terminal publication and event-stream closure after recovery.
+    const recovery = (async () => {
+      let attempt = failedOrPendingClose;
+      let retryCount = 0;
+      while (!this.#hostClosed) {
+        try {
+          await attempt;
+          return;
+        } catch (error) {
+          if (retryCount >= MAX_AUTONOMOUS_HOST_CLOSE_RETRIES) {
+            this.#quarantineCleanup(this.#host, reason);
+            throw error;
+          }
+          retryCount += 1;
+        }
+        await waitForCleanupRetry(
+          Math.max(1, Math.min(1_000, this.#closeSettlementTimeoutMs)),
+        );
+        if (this.#hostClosed) {
+          return;
+        }
+        if (this.#hostClosePromise === attempt) {
+          this.#hostClosePromise = null;
+        }
+        attempt = this.#startHostClose({
+          reason: `${reason} (automatic cleanup recovery ${retryCount})`,
+        });
+      }
+    })();
+    this.#hostCloseRecoveryPromise = recovery;
+    this.#retainCleanup(recovery);
+    void recovery
+      .finally(() => {
+        if (this.#hostCloseRecoveryPromise === recovery) {
+          this.#hostCloseRecoveryPromise = null;
+        }
+      })
+      .catch(() => undefined);
+  }
+
+  async #pumpTurn(turnId: string, turn: AcpxRuntimeTurn): Promise<void> {
+    try {
+      let index = 0;
+      const normalizeToolEvent =
+        createAcpxToolEventNormalizer<AcpRuntimeEvent>();
+      for await (const event of turn.events) {
+        this.#mapRuntimeEvent(normalizeToolEvent(event), turnId, ++index);
+      }
+      const result = await turn.result;
+      if (this.#terminalTurns.has(turnId)) return;
+      if (result.status === "completed") {
+        const finalText = this.#assistantText.trim();
+        if (finalText) {
+          this.#emit(
+            "item.completed",
+            { kind: "agentMessage", channel: "final", text: finalText },
+            { turnId, itemId: `${turnId}:final-answer` },
+          );
+        }
+        this.#publishTerminal(
+          turnId,
+          canonicalJson({
+            status: "completed",
+            semanticResult: this.#semanticFingerprint,
+          }),
+          "turn.completed",
+          { status: "completed", stopReason: result.stopReason ?? null },
+        );
+      } else if (result.status === "cancelled") {
+        this.#publishTerminal(
+          turnId,
+          canonicalJson({ status: "interrupted" }),
+          "turn.interrupted",
+          {
+            status: "interrupted",
+            stopReason: result.stopReason ?? "cancelled",
+          },
+        );
+      } else {
+        this.#emit(
+          "provider.notice.recorded",
+          {
+            schema: "paperclip.provider.notice.v1",
+            noticeId: `${turnId}:failure`,
+            severity: "error",
+            category: "acpx_turn_failed",
+            scope: "turn",
+            recoverable: result.error.retryable ?? false,
+            userActionable: true,
+            summary: safeMessage(result.error.message),
+          },
+          { turnId, itemId: `${turnId}:failure` },
+        );
+        this.#publishTerminal(
+          turnId,
+          canonicalJson({ status: "failed" }),
+          "turn.failed",
+          {
+            status: "failed",
+            error: {
+              code: result.error.code ?? null,
+              message: safeMessage(result.error.message),
+            },
+          },
+        );
+      }
+    } catch (error) {
+      if (this.#terminalTurns.has(turnId)) return;
+      if (error instanceof TerminalEventCapacityError) throw error;
+      if (this.#closed || this.#closingStarted) {
+        this.#publishTerminal(
+          turnId,
+          canonicalJson({ status: "interrupted" }),
+          "turn.interrupted",
+          { status: "interrupted", stopReason: "session_closed" },
+        );
+      } else {
+        this.#publishTerminal(
+          turnId,
+          canonicalJson({ status: "failed" }),
+          "turn.failed",
+          { status: "failed", error: { message: safeMessage(error) } },
+        );
+      }
+    }
+  }
+
+  #publishTerminal(
+    turnId: string,
+    fingerprint: string,
+    eventType: "turn.completed" | "turn.failed" | "turn.interrupted",
+    payload: Record<string, unknown>,
+  ): void {
+    if (this.#terminalTurns.has(turnId)) return;
+    const pendingTerminal = this.#pendingTerminal;
+    if (
+      pendingTerminal !== null &&
+      (pendingTerminal.turnId !== turnId ||
+        pendingTerminal.fingerprint !== fingerprint ||
+        pendingTerminal.eventType !== eventType ||
+        canonicalJson(pendingTerminal.payload) !== canonicalJson(payload))
+    ) {
+      throw new Error(
+        `Codex ACPX terminal disposition changed while ${pendingTerminal.turnId} awaited stream capacity`,
+      );
+    }
+    const terminal = pendingTerminal ?? {
+      turnId,
+      fingerprint,
+      eventType,
+      payload: structuredClone(payload),
+    };
+    this.#pendingTerminal = terminal;
+    if (!this.#emit(terminal.eventType, terminal.payload, { turnId })) {
+      // The persisted terminal index is the driver's settlement authority.
+      // Never advance it unless the matching canonical event is already in
+      // the bounded stream. A caller may drain and retry close, but it cannot
+      // observe a settled turn whose terminal fact was omitted.
+      throw new TerminalEventCapacityError(turnId, eventType);
+    }
+    this.#terminalTurns.set(turnId, fingerprint);
+    this.#pendingTerminal = null;
+    if (this.#activeTurnId === turnId) this.#activeTurnId = null;
+  }
+
+  #mapRuntimeEvent(
+    event: AcpRuntimeEvent,
+    turnId: string,
+    index: number,
+  ): void {
+    const fallbackItemId = `${turnId}:acp:${index}`;
+    if (event.type === "text_delta") {
+      const output = boundedText(event.text, 64 * 1024);
+      if (event.stream !== "thought" && event.tag !== "agent_thought_chunk") {
+        this.#assistantText = boundedText(
+          `${this.#assistantText}${output}`,
+          256 * 1024,
+        );
+      }
+      this.#emit(
+        "item.delta",
+        {
+          kind:
+            event.stream === "thought" || event.tag === "agent_thought_chunk"
+              ? "thinking"
+              : "agent_message",
+          text: output,
+        },
+        { turnId, itemId: fallbackItemId },
+      );
+    }
+    if (event.type === "status" && event.tag === "usage_update") {
+      this.#usage = boundedRecord({
+        cumulative: event.breakdown,
+        cost: event.cost,
+      });
+    }
+    for (const canonical of canonicalProviderEventsFromAcpxRuntimeEvent(
+      event,
+      fallbackItemId,
+      turnId,
+    )) {
+      this.#emit(canonical.eventType, canonical.payload, {
+        turnId,
+        itemId: canonical.itemId,
+      });
+    }
+  }
+
+  #emit(
+    eventType: PrpEvent["eventType"],
+    payload: Record<string, unknown>,
+    refs: { turnId?: string; itemId?: string } = {},
+    reservedAfter = isTerminalEvent(eventType)
+      ? 0
+      : eventType === "run.result.proposed"
+        ? Math.max(0, this.#terminalEventReserve - 1)
+        : this.#terminalEventReserve,
+  ): boolean {
+    if (this.#eventStreamClosed) return false;
+    if (this.#eventStreamOmitted && isTerminalEvent(eventType)) {
+      this.#eventStreamOmitted = false;
+      const recordedOmission = this.#emit(
+        "harness.diagnostic",
+        {
+          code: "event_stream_retention_limit",
+          message:
+            "Earlier provider events were omitted because the consumer exceeded the bounded event buffer.",
+        },
+        refs,
+        1,
+      );
+      if (!recordedOmission) this.#eventStreamOmitted = true;
+    }
+    const sourceSeq = this.#sourceSequence + 1;
+    const event: PrpEvent = {
+      schema: "paperclip.prp.event.v1",
+      sourceEventId: `${this.#sourceInstanceId}:${sourceSeq}`,
+      sourceSeq,
+      sourceInstanceId: this.#sourceInstanceId,
+      sourceKind: "runner",
+      runId: this.#input.runId,
+      normalizedSessionId: this.#input.normalizedSessionId,
+      ...(refs.turnId ? { turnId: refs.turnId } : {}),
+      ...(refs.itemId ? { itemId: refs.itemId } : {}),
+      eventType,
+      schemaVersion: 1,
+      priority: eventType === "run.result.proposed" ? 0 : 1,
+      emittedAt: this.#now().toISOString(),
+      payload: structuredClone(payload),
+    };
+    if (!this.#events.push(event, reservedAfter)) {
+      this.#eventStreamOmitted = true;
+      this.#transcriptEventCount += 1;
+      this.#transcriptOmitted = true;
+      return false;
+    }
+    this.#sourceSequence = sourceSeq;
+    this.#retainTranscriptEvent(event);
+    return true;
+  }
+
+  #retainTranscriptEvent(event: PrpEvent): void {
+    this.#transcriptEventCount += 1;
+    const retained = structuredClone(event);
+    let bytes: number;
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(retained));
+    } catch {
+      this.#transcriptOmitted = true;
+      return;
+    }
+    if (bytes > MAX_TRANSCRIPT_BYTES) {
+      this.#transcriptOmitted = true;
+      return;
+    }
+    this.#transcript.push({ event: retained, bytes });
+    this.#transcriptBytes += bytes;
+    while (
+      this.#transcript.length > MAX_TRANSCRIPT_EVENTS ||
+      this.#transcriptBytes > MAX_TRANSCRIPT_BYTES
+    ) {
+      const omitted = this.#transcript.shift();
+      if (omitted) this.#transcriptBytes -= omitted.bytes;
+      this.#transcriptOmitted = true;
+    }
+  }
+
+  #assertOpen(): void {
+    if (this.#closed || this.#closingStarted) {
+      throw new Error("Codex ACPX session is closing or closed");
+    }
+  }
+}
+
+function waitForCleanupRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    timer.unref();
+  });
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+function boundedRecord(value: unknown): Record<string, unknown> {
+  const serialized = JSON.stringify(value);
+  if (!serialized || Buffer.byteLength(serialized) > 64 * 1024) {
+    return { omitted: true, reason: "payload_limit" };
+  }
+  const parsed: unknown = JSON.parse(serialized);
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
+}
+
+function boundedText(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value);
+  return bytes.length <= maxBytes
+    ? value
+    : bytes.subarray(bytes.length - maxBytes).toString("utf8");
+}
+
+function safeId(value: string, fallback: string): string {
+  const candidate = value.replace(/[^A-Za-z0-9._:-]/g, "-").slice(0, 160);
+  return /^[A-Za-z0-9]/.test(candidate) ? candidate : fallback;
+}
+
+function stableId(prefix: string, value: string): string {
+  const readable = safeId(value, "session").slice(0, 80);
+  const suffix = createHash("sha256").update(value).digest("hex").slice(0, 16);
+  return `${prefix}-${readable}-${suffix}`;
+}
+
+function safeMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(
+      /(key|token|secret|password|authorization)\s*[:=]\s*[^\s,}\]]+/gi,
+      "$1=[REDACTED]",
+    )
+    .slice(0, 4_000);
+}
+
+function isTerminalEvent(eventType: PrpEvent["eventType"]): boolean {
+  return (
+    eventType === "turn.completed" ||
+    eventType === "turn.failed" ||
+    eventType === "turn.interrupted"
+  );
+}
+
+class TerminalEventCapacityError extends Error {
+  constructor(turnId: string, eventType: PrpEvent["eventType"]) {
+    super(
+      `Codex ACPX cannot settle ${turnId} before its ${eventType} event is retained`,
+    );
+    this.name = "TerminalEventCapacityError";
+  }
+}
+
+class AsyncQueue<T> implements AsyncIterable<T> {
+  readonly #items: T[] = [];
+  readonly #waiters: Array<(result: IteratorResult<T>) => void> = [];
+  readonly #maxItems: number;
+  #closed = false;
+
+  constructor(maxItems: number) {
+    this.#maxItems = maxItems;
+  }
+
+  hasCapacity(requiredItems: number): boolean {
+    return (
+      requiredItems <=
+      this.#waiters.length + this.#maxItems - this.#items.length
+    );
+  }
+
+  push(item: T, reservedAfter = 0): boolean {
+    if (this.#closed) return false;
+    // Admission and insertion are one synchronous operation so every regular
+    // event leaves the terminal lane intact. In particular, a lagging
+    // consumer cannot occupy terminal capacity between a check and a push.
+    if (!this.hasCapacity(1 + reservedAfter)) return false;
+    const waiter = this.#waiters.shift();
+    if (waiter) {
+      waiter({ done: false, value: item });
+      return true;
+    }
+    if (this.#items.length >= this.#maxItems) return false;
+    this.#items.push(item);
+    return true;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const waiter of this.#waiters.splice(0)) {
+      waiter({ done: true, value: undefined });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: () => {
+        const item = this.#items.shift();
+        if (item !== undefined) {
+          return Promise.resolve({ done: false, value: item });
+        }
+        if (this.#closed) {
+          return Promise.resolve({ done: true, value: undefined });
+        }
+        return new Promise((resolve) => this.#waiters.push(resolve));
+      },
+    };
+  }
+}
+
+async function settleWithin(
+  promise: Promise<void>,
+  timeoutMs: number,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<void>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("ACPX host cleanup exceeded its shutdown timeout"));
+        }, timeoutMs);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function runAbortableDriverAdmission<T>(
+  signal: AbortSignal | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (signal === undefined) return await operation();
+  signal.throwIfAborted();
+  return await raceDriverAdmissionWithAbort(
+    Promise.resolve().then(operation),
+    signal,
+  );
+}
+
+function raceDriverAdmissionWithAbort<T>(
+  pending: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const settle = (operation: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = (): void => settle(() => reject(signal.reason));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    void pending.then(
+      (value) => settle(() => resolve(value)),
+      (error: unknown) => settle(() => reject(error)),
+    );
+  });
+}
+
+async function settlesWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

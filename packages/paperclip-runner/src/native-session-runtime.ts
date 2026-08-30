@@ -15,6 +15,35 @@ export const DEFAULT_NATIVE_RUNTIME_INPUT_LIVE_WINDOW_MS = 120_000;
 const OPTIONAL_SESSION_CANCELLATION_GRACE_MS = 100;
 const FAILED_OPERATION_SETTLEMENT_GRACE_MS = 100;
 const DEFAULT_NATIVE_CHECKPOINT_TIMEOUT_MS = 30_000;
+const failedSessionCleanupOwners = new Set<Promise<void>>();
+const FAILED_SESSION_CLOSE_RETRY_MS = 1_000;
+const MAX_FAILED_SESSION_CLOSE_RETRIES = 3;
+const MAX_QUARANTINED_SESSION_CLOSE_RETRIES = 3;
+const QUARANTINED_SESSION_CLOSE_RETRY_MS = 60_000;
+// Admission can inherit the initial close plus all three retained retries.
+// Keep the wait finite while covering every bounded close attempt and all
+// three production retry delays instead of timing out midway through recovery.
+const QUARANTINED_SESSION_CLOSE_ATTEMPT_BOUND_MS = 7_000;
+const QUARANTINED_SESSION_ADMISSION_GRACE_MS =
+  (MAX_FAILED_SESSION_CLOSE_RETRIES + 1) *
+    QUARANTINED_SESSION_CLOSE_ATTEMPT_BOUND_MS +
+  MAX_FAILED_SESSION_CLOSE_RETRIES *
+    FAILED_SESSION_CLOSE_RETRY_MS;
+// Admission can observe a retained close recovery and then the one quarantine
+// recovery that retained owner installs when it exhausts its retries. Give
+// each owner generation a complete finite grace, while rejecting any
+// unexpected third generation instead of permitting an unbounded owner chain.
+const MAX_QUARANTINED_SESSION_ADMISSION_OWNER_PHASES = 2;
+
+interface QuarantinedSessionCleanup {
+  session: NativeSession;
+  attempt: Promise<void> | null;
+  recovery: Promise<void> | null;
+  recoveryMaxAttempts: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+const quarantinedSessionCleanups = new Set<QuarantinedSessionCleanup>();
 
 export interface ExecuteNativeSessionOptions {
   input: NativeExecutionInput;
@@ -300,6 +329,172 @@ async function persistCheckpointWithin(input: {
   }
 }
 
+function waitForSessionCloseRetry(): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, FAILED_SESSION_CLOSE_RETRY_MS);
+    timer.unref?.();
+  });
+}
+function quarantineSessionCleanup(session: NativeSession): void {
+  if ([...quarantinedSessionCleanups].some((entry) => entry.session === session)) {
+    return;
+  }
+  const cleanup: QuarantinedSessionCleanup = {
+    session,
+    attempt: null,
+    recovery: null,
+    recoveryMaxAttempts: null,
+    timer: null,
+  };
+  quarantinedSessionCleanups.add(cleanup);
+  startQuarantinedSessionCleanupRecovery(
+    cleanup,
+    MAX_QUARANTINED_SESSION_CLOSE_RETRIES,
+    "native session quarantined cleanup recovery",
+  );
+}
+
+function startQuarantinedSessionCleanupRecovery(
+  cleanup: QuarantinedSessionCleanup,
+  maxAttempts: number,
+  reason: string,
+): Promise<void> {
+  if (cleanup.recovery) return cleanup.recovery;
+  const recovery = (async () => {
+    for (
+      let attemptCount = 0;
+      attemptCount < maxAttempts && quarantinedSessionCleanups.has(cleanup);
+      attemptCount += 1
+    ) {
+      // The first retry starts immediately so an admission-triggered recovery
+      // receives the complete close grace. Later attempts retain the bounded
+      // delay that prevents a hot retry loop.
+      if (attemptCount > 0) await waitForSessionCloseRetry();
+      const attempt = Promise.resolve().then(() => cleanup.session.close({
+        reason,
+      }));
+      cleanup.attempt = attempt;
+      try {
+        await attempt;
+        quarantinedSessionCleanups.delete(cleanup);
+      } catch {
+        // Retain the quarantine after this finite, sequential retry batch.
+      } finally {
+        if (cleanup.attempt === attempt) cleanup.attempt = null;
+      }
+    }
+  })();
+  cleanup.recovery = recovery;
+  cleanup.recoveryMaxAttempts = maxAttempts;
+  failedSessionCleanupOwners.add(recovery);
+  void recovery.finally(() => {
+    failedSessionCleanupOwners.delete(recovery);
+    if (cleanup.recovery === recovery) {
+      cleanup.recovery = null;
+      cleanup.recoveryMaxAttempts = null;
+    }
+    scheduleQuarantinedSessionCleanup(cleanup);
+  }).catch(() => undefined);
+  return recovery;
+}
+
+function scheduleQuarantinedSessionCleanup(
+  cleanup: QuarantinedSessionCleanup,
+): void {
+  if (
+    !quarantinedSessionCleanups.has(cleanup)
+    || cleanup.recovery
+    || cleanup.attempt
+    || cleanup.timer
+  ) {
+    return;
+  }
+  // Keep cleanup live without a hot retry loop: one unref'd timer and one
+  // sequential close are the maximum background work owned by each entry.
+  // A later admission may accelerate, but never overlap, the scheduled try.
+  cleanup.timer = setTimeout(() => {
+    cleanup.timer = null;
+    if (!quarantinedSessionCleanups.has(cleanup)) return;
+    startQuarantinedSessionCleanupRecovery(
+      cleanup,
+      1,
+      "native session scheduled quarantined cleanup recovery",
+    );
+  }, QUARANTINED_SESSION_CLOSE_RETRY_MS);
+  cleanup.timer.unref?.();
+}
+
+async function retryQuarantinedSessionCleanups(): Promise<void> {
+  // A close attempt becomes admission-visible as soon as the runtime retains
+  // its exact cleanup owner. It may not have rejected yet, so it may not have
+  // entered the retry quarantine below. Observe both states through the same
+  // finite gate to prevent a later execution from opening a second provider
+  // session while the first close still owns provider resources.
+  const observedOwners = new Set<Promise<void>>();
+  const acceleratedCleanups = new Set<QuarantinedSessionCleanup>();
+  let observedOwnerPhases = 0;
+  while (true) {
+    const cleanupOwners = new Set<Promise<void>>(failedSessionCleanupOwners);
+    for (const cleanup of quarantinedSessionCleanups) {
+      if (cleanup.timer) {
+        clearTimeout(cleanup.timer);
+        cleanup.timer = null;
+      }
+      if (cleanup.recovery) {
+        // An autonomous scheduled owner receives one attempt. Admission must
+        // observe it without mistaking it for the complete three-attempt
+        // admission batch; if that attempt fails, the next bounded owner
+        // phase accelerates one full batch. Existing full recoveries already
+        // consumed that allowance and are never duplicated.
+        if (
+          (cleanup.recoveryMaxAttempts ?? 0)
+            >= MAX_QUARANTINED_SESSION_CLOSE_RETRIES
+        ) {
+          acceleratedCleanups.add(cleanup);
+        }
+        cleanupOwners.add(cleanup.recovery);
+      } else if (!acceleratedCleanups.has(cleanup)) {
+        acceleratedCleanups.add(cleanup);
+        cleanupOwners.add(startQuarantinedSessionCleanupRecovery(
+          cleanup,
+          MAX_QUARANTINED_SESSION_CLOSE_RETRIES,
+          "native session quarantined admission recovery",
+        ));
+      }
+    }
+    const replacementOwners = [...cleanupOwners].filter(
+      (owner) => !observedOwners.has(owner),
+    );
+    if (replacementOwners.length === 0) break;
+    replacementOwners.forEach((owner) => observedOwners.add(owner));
+    observedOwnerPhases += 1;
+    if (
+      observedOwnerPhases > MAX_QUARANTINED_SESSION_ADMISSION_OWNER_PHASES
+      || !(await settlesWithin(
+        Promise.all(replacementOwners.map((owner) => owner.catch(() => undefined))),
+        QUARANTINED_SESSION_ADMISSION_GRACE_MS,
+      ))
+    ) {
+      throw new Error(
+        "native_session_cleanup_quarantined: prior session cleanup exceeded the admission grace",
+      );
+    }
+  }
+  if (
+    failedSessionCleanupOwners.size > 0
+    || quarantinedSessionCleanups.size > 0
+  ) {
+    // Admission may have pulled a scheduled retry forward and observed a
+    // complete recovery batch that still failed. Restore autonomous ownership
+    // before rejecting so cleanup cannot remain dormant until another run.
+    for (const cleanup of quarantinedSessionCleanups) {
+      scheduleQuarantinedSessionCleanup(cleanup);
+    }
+    throw new Error(
+      "native_session_cleanup_quarantined: prior session cleanup remains incomplete",
+    );
+  }
+}
 async function consumeTurn(
   session: NativeSession,
   controlPlane: ControlPlanePort,
@@ -742,6 +937,7 @@ function checkpointedResultlessDispositionFallback(input: {
  * authority through ControlPlanePort; provider/session behavior stays here.
  */
 export async function executeNativeSession(options: ExecuteNativeSessionOptions): Promise<NativeSessionExecutionResult> {
+  await retryQuarantinedSessionCleanups();
   const input = parseNativeExecutionInput(options.input);
   const descriptor = await options.backend.descriptor();
   if ("runtimeContext" in input) {
@@ -945,14 +1141,68 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
       // Owner notification cannot prevent provider cleanup.
     }
   };
+  let failedCleanupDeferred = false;
+  let sessionCloseRecoveryPromise: Promise<void> | null = null;
+  const retainFailedCleanup = (cleanup: Promise<void>) => {
+    failedCleanupDeferred = true;
+    quarantineSession();
+    failedSessionCleanupOwners.add(cleanup);
+    void cleanup.then(
+      () => failedSessionCleanupOwners.delete(cleanup),
+      () => failedSessionCleanupOwners.delete(cleanup),
+    );
+  };
+  const startSessionClose = (reason: string) => {
+    const attempt = session.close({ reason });
+    sessionClosePromise = attempt;
+    return attempt;
+  };
   const closeSession = () => {
     if (sessionClosePromise === null) {
       quarantineSession();
-      sessionClosePromise = session.close({
-        reason: "native session execution complete",
-      });
+      const firstAttempt = startSessionClose(
+        "native session execution complete",
+      );
+      // Preserve the first close outcome for its caller. If an exact attempt
+      // fails, retain one ordered, delay-bounded production recovery within a
+      // finite retry budget. A still-pending attempt is never overlapped or
+      // replaced, and repeated terminal failure cannot create an immortal loop.
+      const recovery = (async () => {
+        let attempt = firstAttempt;
+        let retryCount = 0;
+        while (true) {
+          try {
+            await attempt;
+            return;
+          } catch (error) {
+            if (retryCount >= MAX_FAILED_SESSION_CLOSE_RETRIES) {
+              quarantineSessionCleanup(session);
+              throw error;
+            }
+            retryCount += 1;
+            await waitForSessionCloseRetry();
+            if (sessionClosePromise === attempt) {
+              sessionClosePromise = null;
+            }
+            attempt = startSessionClose(
+              `native session cleanup recovery after close failure (${retryCount})`,
+            );
+          }
+        }
+      })();
+      sessionCloseRecoveryPromise = recovery;
+      retainFailedCleanup(recovery);
+      void recovery.finally(() => {
+        if (sessionCloseRecoveryPromise === recovery) {
+          sessionCloseRecoveryPromise = null;
+        }
+      }).catch(() => undefined);
     }
-    return sessionClosePromise;
+    const activeClose = sessionClosePromise;
+    if (activeClose === null) {
+      throw new Error("native session cleanup lost its active close attempt");
+    }
+    return activeClose;
   };
   let executionSucceeded = false;
   try {
@@ -1376,7 +1626,10 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
     executionSucceeded = true;
     return { ...durableExecutionResult, ...enrichment };
   } finally {
-    if (!options.keepSessionOpen || !executionSucceeded || sessionQuarantined) {
+    if (
+      (!options.keepSessionOpen || !executionSucceeded || sessionQuarantined)
+      && !failedCleanupDeferred
+    ) {
       // A provider that ignores close must not keep execution pending forever.
       // closeSession removes it from the caller before invoking the backend;
       // retain observation of the promise, but bound the final join. Provider

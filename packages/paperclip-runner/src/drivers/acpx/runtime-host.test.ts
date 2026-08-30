@@ -301,6 +301,77 @@ describe("ACPX runtime host", () => {
     expect(fixture.commandClose).toHaveBeenCalledOnce();
   });
 
+  it("retains failed admission cleanup until provider shutdown permits credential scrub", async () => {
+    const fixture = await hostFixture();
+    let authPath = "";
+    let credentialHome = "";
+    let resolveRetryClose!: () => void;
+    const retryClose = new Promise<void>((resolve) => {
+      resolveRetryClose = resolve;
+    });
+    const runtime = runtimePort({
+      getStatus: async () => ({
+        models: {
+          currentModelId: "wrong-model",
+          availableModelIds: ["wrong-model"],
+        },
+      }),
+      onClose: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("first admission cleanup failed"))
+        .mockImplementationOnce(() => retryClose),
+    });
+
+    await expect(
+      AcpxRuntimeHost.open(
+        {
+          ...fixture.options,
+          agent: "codex",
+          model: "gpt-5.6-sol",
+          permissionMode: "approve-all",
+          environment: {
+            PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET:
+              '{"owner":"failed-admission"}',
+          },
+        },
+        fixture.dependencies({
+          openRuntime: async (options) => {
+            credentialHome = options.launchEnvironment.CODEX_HOME!;
+            authPath = join(credentialHome, "auth.json");
+            return runtime;
+          },
+        }),
+      ),
+    ).rejects.toThrow(/initialization and cleanup failed/);
+
+    await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(2));
+    await expect(readFile(authPath, "utf8")).resolves.toContain(
+      "failed-admission",
+    );
+    await expect(
+      stageManagedCodexCredential({
+        agentHomeDirectory: credentialHome,
+        environment: {
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+        },
+      }),
+    ).rejects.toThrow("already has an active lease");
+
+    resolveRetryClose();
+    await vi.waitFor(async () => {
+      await expect(readFile(authPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    });
+    const contender = await stageManagedCodexCredential({
+      agentHomeDirectory: credentialHome,
+      environment: {
+        PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+      },
+    });
+    await contender.close();
+  });
+
   it("retains credential ownership when runtime shutdown fails until retry succeeds", async () => {
     const fixture = await hostFixture();
     let failClose = true;
@@ -402,6 +473,67 @@ describe("ACPX runtime host", () => {
     await contender.close();
   });
 
+  it("retains the exact pending cleanup while independent resources close", async () => {
+    const fixture = await hostFixture();
+    const firstClose = new Promise<void>(() => undefined);
+    const runtime = runtimePort({
+      onClose: vi.fn()
+        .mockImplementationOnce(() => firstClose)
+        .mockResolvedValueOnce(undefined),
+    });
+    const host = await AcpxRuntimeHost.open(
+      {
+        ...fixture.options,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionMode: "approve-all",
+        environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
+      },
+      fixture.dependencies({ openRuntime: async () => runtime }),
+    );
+
+    const first = host.close({ reason: "first close stalls" });
+    await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledOnce());
+    const second = host.close({ reason: "same pending owner" });
+    let settled = false;
+    void Promise.all([first, second]).finally(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(runtime.close).toHaveBeenCalledOnce();
+    expect(fixture.commandClose).toHaveBeenCalledOnce();
+  });
+
+  it("retries only after the exact close outcome settles with failure", async () => {
+    const fixture = await hostFixture();
+    const runtime = runtimePort({
+      onClose: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("runtime close failed"))
+        .mockResolvedValueOnce(undefined),
+    });
+    const host = await AcpxRuntimeHost.open(
+      {
+        ...fixture.options,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionMode: "approve-all",
+        environment: { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" },
+      },
+      fixture.dependencies({ openRuntime: async () => runtime }),
+    );
+
+    await expect(host.close({ reason: "first close" })).rejects.toThrow(
+      /cleanup failed/,
+    );
+    await expect(
+      host.close({ reason: "fresh attempt" }),
+    ).resolves.toBeUndefined();
+    await expect(host.close({ reason: "ownership released" })).resolves.toBeUndefined();
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+  });
+
   it("admits one bounded turn and cancels it before shutdown", async () => {
     const fixture = await hostFixture();
     const turn = runtimeTurn();
@@ -428,6 +560,9 @@ describe("ACPX runtime host", () => {
     expect(() =>
       host.startTurn({ text: "Concurrent", requestId: "turn-2" }),
     ).toThrow("already has an active turn");
+
+    await host.interruptActiveTurn("user interrupt");
+    expect(turn.cancel).toHaveBeenCalledWith({ reason: "user interrupt" });
 
     await host.close({ reason: "shutdown" });
     expect(turn.cancel).toHaveBeenCalledWith({ reason: "shutdown" });
@@ -680,13 +815,23 @@ describe("ACPX runtime host", () => {
     expect(fixture.commandClose).not.toHaveBeenCalled();
   });
 
-  it("forwards cancellation and closes a runtime that resolves after abort", async () => {
+  it("retains managed credentials until an aborted late runtime is closed", async () => {
     const fixture = await hostFixture();
     const runtimeAdmission = deferred<AcpxRuntimePort>();
-    const lateRuntime = runtimePort();
+    const retryClose = deferred<void>();
+    const lateRuntime = runtimePort({
+      onClose: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("late runtime close failed"))
+        .mockImplementationOnce(() => retryClose.promise),
+    });
     let receivedSignal: AbortSignal | undefined;
+    let credentialHome = "";
+    let bridgeUrl = "";
     const openRuntime = vi.fn((options) => {
       receivedSignal = options.signal;
+      credentialHome = options.launchEnvironment.CODEX_HOME!;
+      bridgeUrl = options.mcpServers[0]!.url;
       return runtimeAdmission.promise;
     });
     const controller = new AbortController();
@@ -701,6 +846,10 @@ describe("ACPX runtime host", () => {
           PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}",
         },
         signal: controller.signal,
+        semanticTools: {
+          tools: [],
+          handler: async () => ({ ok: true }),
+        },
       },
       fixture.dependencies({ openRuntime }),
     );
@@ -710,11 +859,82 @@ describe("ACPX runtime host", () => {
     controller.abort(cancellation);
     await expect(opening).rejects.toBe(cancellation);
     expect(fixture.commandClose).toHaveBeenCalledOnce();
-    runtimeAdmission.resolve(lateRuntime);
+    await expect(fetch(bridgeUrl)).rejects.toThrow();
+    const authPath = join(credentialHome, "auth.json");
+    await expect(readFile(authPath, "utf8")).resolves.toBe("{}");
+    await expect(
+      stageManagedCodexCredential({
+        agentHomeDirectory: credentialHome,
+        environment: {
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+        },
+      }),
+    ).rejects.toThrow("already has an active lease");
 
-    await vi.waitFor(() => expect(lateRuntime.close).toHaveBeenCalledWith({
+    runtimeAdmission.resolve(lateRuntime);
+    await vi.waitFor(() => expect(lateRuntime.close).toHaveBeenCalledTimes(2));
+    expect(lateRuntime.close).toHaveBeenNthCalledWith(1, {
       reason: "ACPX runtime admission aborted",
-    }));
+    });
+    await expect(readFile(authPath, "utf8")).resolves.toBe("{}");
+    await expect(
+      stageManagedCodexCredential({
+        agentHomeDirectory: credentialHome,
+        environment: {
+          PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+        },
+      }),
+    ).rejects.toThrow("already has an active lease");
+
+    retryClose.resolve(undefined);
+    await vi.waitFor(async () => {
+      await expect(readFile(authPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    });
+    const contender = await stageManagedCodexCredential({
+      agentHomeDirectory: credentialHome,
+      environment: {
+        PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: '{"owner":"contender"}',
+      },
+    });
+    await contender.close();
+  });
+
+  it("quarantines credentials when aborted runtime cleanup is uncertain", async () => {
+    const fixture = await hostFixture();
+    const runtimeAdmission = deferred<AcpxRuntimePort>();
+    const credentialClose = vi.fn(async () => undefined);
+    const controller = new AbortController();
+    const cancellation = new Error("runtime admission cancelled");
+    const openRuntime = vi.fn(() => runtimeAdmission.promise);
+    const opening = AcpxRuntimeHost.open(
+      {
+        ...fixture.options,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionMode: "deny-all",
+        signal: controller.signal,
+      },
+      {
+        ...fixture.dependencies({ openRuntime }),
+        stageCredential: async () => ({
+          path: join(fixture.root, "auth.json"),
+          mode: "inline_json",
+          close: credentialClose,
+        }),
+      },
+    );
+    await vi.waitFor(() => expect(openRuntime).toHaveBeenCalledOnce());
+
+    controller.abort(cancellation);
+    await expect(opening).rejects.toBe(cancellation);
+    const cleanupFailure = new Error("provider survived forced cleanup");
+    runtimeAdmission.reject(new AggregateError([cancellation, cleanupFailure]));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(credentialClose).not.toHaveBeenCalled();
+    expect(fixture.commandClose).toHaveBeenCalledOnce();
   });
 });
 
@@ -804,10 +1024,13 @@ async function hostFixture() {
 function deferred<T>(): {
   promise: Promise<T>;
   resolve(value: T): void;
+  reject(reason: unknown): void;
 } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((settle, fail) => {
     resolve = settle;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }

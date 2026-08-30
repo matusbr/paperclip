@@ -150,6 +150,436 @@ describe("Codex ACPX runtime adapter", () => {
     });
   });
 
+  it("retries protocol cleanup after a retained attempt never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      const runtimeClose = new Promise<void>(() => {});
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(runtimeClose)
+        .mockResolvedValueOnce(undefined);
+      const child = fakeChild();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      const firstClose = expect(
+        port.close({ reason: "runtime close stalled" }),
+      ).rejects.toThrow("ACPX runtime and provider cleanup failed");
+      await Promise.resolve();
+      expect(runtime.close).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      await firstClose;
+
+      // The first exact cleanup remains owned, but it cannot become the retry
+      // barrier after its bounded observation and provider termination finish.
+      expect(runtime.close).toHaveBeenCalledOnce();
+      await expect(port.close({ reason: "idempotent terminal close" }))
+        .resolves.toBeUndefined();
+      expect(runtime.close).toHaveBeenCalledTimes(2);
+      expect(runtime.close).toHaveBeenLastCalledWith({
+        handle: HANDLE,
+        reason: "idempotent terminal close",
+        discardPersistentState: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("allows a fresh close after a retained attempt rejects late", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      let rejectRuntimeClose!: (error: unknown) => void;
+      const runtimeClose = new Promise<void>((_resolve, reject) => {
+        rejectRuntimeClose = reject;
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(runtimeClose)
+        .mockResolvedValueOnce(undefined);
+      const child = fakeChild();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      const firstClose = expect(
+        port.close({ reason: "runtime close stalled" }),
+      ).rejects.toThrow("ACPX runtime and provider cleanup failed");
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await firstClose;
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+
+      const protocolFailure = new Error("late protocol close failure");
+      rejectRuntimeClose(protocolFailure);
+      await Promise.resolve();
+      await expect(port.close({ reason: "retry after retained failure" }))
+        .resolves.toBeUndefined();
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(3));
+      expect(runtime.close).toHaveBeenLastCalledWith({
+        handle: HANDLE,
+        reason: "ACPX late protocol cleanup reconciliation 1",
+        discardPersistentState: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconciles an older close that fails after a fresh close succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      let rejectFirstClose!: (error: unknown) => void;
+      const firstRuntimeClose = new Promise<void>((_resolve, reject) => {
+        rejectFirstClose = reject;
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(firstRuntimeClose)
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce(undefined);
+      const child = fakeChild();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      const firstClose = expect(
+        port.close({ reason: "first protocol close stalls" }),
+      ).rejects.toThrow("ACPX runtime and provider cleanup failed");
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await firstClose;
+
+      await expect(port.close({ reason: "fresh protocol close succeeds" }))
+        .resolves.toBeUndefined();
+      expect(runtime.close).toHaveBeenCalledTimes(2);
+
+      rejectFirstClose(new Error("older protocol close failed late"));
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(3));
+      expect(runtime.close).toHaveBeenLastCalledWith({
+        handle: HANDLE,
+        reason: "ACPX late protocol cleanup reconciliation 1",
+        discardPersistentState: false,
+      });
+      await expect(port.close({ reason: "observe reconciled cleanup" }))
+        .resolves.toBeUndefined();
+      expect(runtime.close).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconciles an older late failure that settles during a fresh close", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      let rejectFirstClose!: (error: unknown) => void;
+      const firstRuntimeClose = new Promise<void>((_resolve, reject) => {
+        rejectFirstClose = reject;
+      });
+      let resolveFreshClose!: () => void;
+      const freshRuntimeClose = new Promise<void>((resolve) => {
+        resolveFreshClose = resolve;
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(firstRuntimeClose)
+        .mockReturnValueOnce(freshRuntimeClose)
+        .mockResolvedValueOnce(undefined);
+      const child = fakeChild();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      const firstClose = expect(
+        port.close({ reason: "first protocol close stalls" }),
+      ).rejects.toThrow("ACPX runtime and provider cleanup failed");
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await firstClose;
+
+      const freshClose = port.close({
+        reason: "fresh protocol close remains in flight",
+      });
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(2));
+      rejectFirstClose(new Error("older protocol close failed during retry"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.close).toHaveBeenCalledTimes(2);
+
+      resolveFreshClose();
+      await freshClose;
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(3));
+      expect(runtime.close).toHaveBeenLastCalledWith({
+        handle: HANDLE,
+        reason: "ACPX late protocol cleanup reconciliation 1",
+        discardPersistentState: false,
+      });
+      await expect(port.close({ reason: "observe reconciled cleanup" }))
+        .resolves.toBeUndefined();
+      expect(runtime.close).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let late settlements bypass the reconciliation retry bound", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      const deferred = Array.from({ length: 4 }, () => {
+        let resolve!: () => void;
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+          resolve = resolvePromise;
+          reject = rejectPromise;
+        });
+        return { promise, reject, resolve };
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(deferred[0]!.promise)
+        .mockResolvedValueOnce(undefined)
+        .mockReturnValueOnce(deferred[1]!.promise)
+        .mockReturnValueOnce(deferred[2]!.promise)
+        .mockReturnValueOnce(deferred[3]!.promise);
+      const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: () => runtime,
+      });
+
+      const firstClose = expect(
+        port.close({ reason: "first protocol close stalls" }),
+      ).rejects.toThrow("ACPX runtime and provider cleanup failed");
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await firstClose;
+      await expect(port.close({ reason: "fresh protocol close succeeds" }))
+        .resolves.toBeUndefined();
+
+      deferred[0]!.reject(new Error("older protocol close failed late"));
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(3));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(4));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(5));
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      // The third automatic attempt has exhausted the budget. Its eventual
+      // late rejection must not manufacture an unbounded fourth generation.
+      deferred[3]!.reject(new Error("final reconciliation failed late"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.close).toHaveBeenCalledTimes(5);
+      deferred[1]!.resolve();
+      deferred[2]!.resolve();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shares one reconciliation budget across sequential late failures", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      const releasedAttempts = Array.from({ length: 4 }, () => {
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<void>((_resolve, rejectPromise) => {
+          reject = rejectPromise;
+        });
+        return { promise, reject };
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(releasedAttempts[0]!.promise)
+        .mockReturnValueOnce(releasedAttempts[1]!.promise)
+        .mockReturnValueOnce(releasedAttempts[2]!.promise)
+        .mockReturnValueOnce(releasedAttempts[3]!.promise)
+        .mockResolvedValue(undefined);
+      const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: () => runtime,
+        runtimeCloseTimeoutMs: 1,
+      });
+
+      for (const reason of [
+        "first released close",
+        "second released close",
+        "third released close",
+        "fourth released close",
+      ]) {
+        const close = expect(port.close({ reason })).rejects.toThrow(
+          "ACPX runtime and provider cleanup failed",
+        );
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1);
+        await close;
+      }
+      await expect(port.close({ reason: "newer close succeeds" }))
+        .resolves.toBeUndefined();
+      expect(runtime.close).toHaveBeenCalledTimes(5);
+
+      for (let index = 0; index < 3; index += 1) {
+        releasedAttempts[index]!.reject(
+          new Error(`released close ${index + 1} failed late`),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        expect(runtime.close).toHaveBeenCalledTimes(6 + index);
+      }
+
+      // Three automatic attempts exhaust the one port-lifetime budget. The
+      // fourth watched attempt cannot replenish it merely by failing after
+      // the preceding reconciliation closes succeeded.
+      releasedAttempts[3]!.reject(
+        new Error("released close 4 failed after the global budget"),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.close).toHaveBeenCalledTimes(8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rechecks late failures when a reconciliation owner finalizes", async () => {
+    vi.useFakeTimers();
+    let releaseOwnerFinalizer: (() => void) | undefined;
+    try {
+      const runtime = fakeRuntime();
+      const deferred = Array.from({ length: 3 }, () => {
+        let resolve!: () => void;
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+          resolve = resolvePromise;
+          reject = rejectPromise;
+        });
+        return { promise, reject, resolve };
+      });
+      vi.mocked(runtime.close)
+        .mockReturnValueOnce(deferred[0]!.promise)
+        .mockReturnValueOnce(deferred[1]!.promise)
+        .mockReturnValueOnce(deferred[2]!.promise)
+        .mockResolvedValueOnce(undefined);
+      const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: () => runtime,
+        runtimeCloseTimeoutMs: 1,
+      });
+
+      for (const reason of ["first close stalls", "second close stalls"]) {
+        const close = expect(port.close({ reason })).rejects.toThrow(
+          "ACPX runtime and provider cleanup failed",
+        );
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1);
+        await close;
+      }
+
+      const originalFinally = Promise.prototype.finally;
+      let finalizerRegistrations = 0;
+      const ownerFinalizerGate = new Promise<void>((resolve) => {
+        releaseOwnerFinalizer = resolve;
+      });
+      const finallySpy = vi
+        .spyOn(Promise.prototype, "finally")
+        .mockImplementation(function (onFinally) {
+          finalizerRegistrations += 1;
+          // closeRuntime first retains its protocol outcome; the next new
+          // finalizer owns the reconciliation generation. Hold that owner
+          // after its retry decision while the second released attempt fails.
+          if (finalizerRegistrations !== 2) {
+            return originalFinally.call(this, onFinally);
+          }
+          return originalFinally.call(this, () => {
+            deferred[1]!.reject(new Error("second retained close failed"));
+            return ownerFinalizerGate.then(() => onFinally?.());
+          });
+        });
+      try {
+        deferred[0]!.reject(new Error("first retained close failed"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(runtime.close).toHaveBeenCalledTimes(3);
+        expect(finalizerRegistrations).toBeGreaterThanOrEqual(2);
+      } finally {
+        finallySpy.mockRestore();
+      }
+
+      deferred[2]!.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.close).toHaveBeenCalledTimes(3);
+      releaseOwnerFinalizer();
+      releaseOwnerFinalizer = undefined;
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(runtime.close).toHaveBeenCalledTimes(4);
+      expect(runtime.close).toHaveBeenLastCalledWith({
+        handle: HANDLE,
+        reason: "ACPX late protocol cleanup reconciliation 2",
+        discardPersistentState: false,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.close).toHaveBeenCalledTimes(4);
+      await expect(port.close({ reason: "observe reconciled cleanup" }))
+        .resolves.toBeUndefined();
+      expect(runtime.close).toHaveBeenCalledTimes(4);
+    } finally {
+      releaseOwnerFinalizer?.();
+      vi.useRealTimers();
+    }
+  });
+
   it("maps prompt turns to the admitted ACPX handle", async () => {
     const runtime = fakeRuntime();
     const turn = {

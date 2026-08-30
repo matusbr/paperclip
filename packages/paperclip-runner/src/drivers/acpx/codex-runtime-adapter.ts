@@ -22,6 +22,29 @@ import { decideAcpxPermission } from "./permission-policy.js";
 
 const VERIFIED_COMMAND_SENTINEL = "paperclip-verified-acpx-command";
 const DEFAULT_RUNTIME_CLOSE_TIMEOUT_MS = 2_000;
+const PROVIDER_TERM_EXIT_TIMEOUT_MS = 2_000;
+const PROVIDER_KILL_EXIT_TIMEOUT_MS = 2_000;
+const MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS = 3;
+// Production shutdown waits for the protocol close bound before beginning the
+// sequential TERM/KILL verification windows. Keep this exported package-local
+// bound aligned with the implementation so admission can include the complete
+// provider cleanup path instead of accounting for only part of it.
+export const DEFAULT_CODEX_ACPX_RUNTIME_SHUTDOWN_BOUND_MS =
+  DEFAULT_RUNTIME_CLOSE_TIMEOUT_MS +
+  PROVIDER_TERM_EXIT_TIMEOUT_MS +
+  PROVIDER_KILL_EXIT_TIMEOUT_MS;
+// A close may outlive its caller-facing wait bound. Keep every exact attempt
+// owned until it settles even after the port releases it for a bounded retry.
+// This prevents abandoned protocol work from being garbage-collected without
+// letting one permanently pending attempt block all future recovery.
+const activeRuntimeCleanupOwners = new Set<Promise<unknown>>();
+
+class AcpxRuntimeCloseTimeoutError extends Error {
+  constructor() {
+    super("ACPX runtime close exceeded its shutdown timeout");
+    this.name = "AcpxRuntimeCloseTimeoutError";
+  }
+}
 const activeCodexRuntimeCleanupOwners = new Set<Promise<unknown>>();
 
 export interface CodexAcpxRuntimeDependencies {
@@ -304,17 +327,15 @@ class RuntimeAdmissionCleanup {
       if (handle !== null) {
         const key = runtimeHandleCleanupKey(handle);
         if (!this.#closedHandles.has(key)) {
-          const runtimeError = await closeRuntimeWithin(this.runtime, {
-            input: {
-              handle,
-              reason,
-              discardPersistentState: false,
-            },
-            timeoutMs: this.runtimeCloseTimeoutMs,
-          });
+          const runtimeError = await boundedRuntimeClose(
+            this.runtime,
+            handle,
+            reason,
+            this.runtimeCloseTimeoutMs,
+          );
           // A rejection or timeout does not prove the runtime released this
           // identity. Leave it eligible for the next serialized cleanup pass.
-          if (runtimeError === undefined) {
+          if (runtimeError === null) {
             this.#closedHandles.add(key);
           } else {
             errors.push(runtimeError);
@@ -349,7 +370,127 @@ function runtimePort(
   children: SpawnedChildSet,
   runtimeCloseTimeoutMs: number,
 ): AcpxRuntimePort {
-  return {
+  let runtimeClosed = false;
+  let runtimeCloseAttempt: Promise<unknown | null> | undefined;
+  let runtimeCloseAttemptReconciliationGeneration = 0;
+  let lateReconciliationOwner: Promise<void> | undefined;
+  // This is a lifetime budget for the port, not a per-failure-generation
+  // budget. A released attempt may settle after a newer close succeeds, so
+  // replenishing the counter on success would let each older attempt create a
+  // fresh fully budgeted reconciliation loop.
+  let lateReconciliationAttempts = 0;
+  let lateFailureGeneration = 0;
+  let reconciledLateFailureGeneration = 0;
+  const watchedReleasedAttempts = new Set<Promise<unknown | null>>();
+
+  const hasUnreconciledLateFailure = (): boolean =>
+    reconciledLateFailureGeneration < lateFailureGeneration;
+
+  const scheduleLateFailureReconciliation = (): void => {
+    if (
+      runtimeCloseAttempt ||
+      lateReconciliationOwner ||
+      !hasUnreconciledLateFailure() ||
+      lateReconciliationAttempts >=
+        MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS
+    ) {
+      return;
+    }
+    const attemptNumber = lateReconciliationAttempts + 1;
+    lateReconciliationAttempts = attemptNumber;
+    let retry = false;
+    const reconciliation = closeRuntime({
+      reason: `ACPX late protocol cleanup reconciliation ${attemptNumber}`,
+    }).then(
+      () => {
+        if (hasUnreconciledLateFailure()) {
+          retry =
+            attemptNumber < MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS;
+        }
+      },
+      () => {
+        retry =
+          attemptNumber < MAX_LATE_RUNTIME_CLEANUP_RECONCILIATION_ATTEMPTS;
+      },
+    );
+    const owner = reconciliation.finally(() => {
+      if (lateReconciliationOwner === owner) lateReconciliationOwner = undefined;
+      if (retry || hasUnreconciledLateFailure()) {
+        queueMicrotask(scheduleLateFailureReconciliation);
+      }
+    });
+    lateReconciliationOwner = owner;
+    retainRuntimeCleanupOwner(owner);
+  };
+
+  const watchReleasedAttempt = (attempt: Promise<unknown | null>): void => {
+    if (watchedReleasedAttempts.has(attempt)) return;
+    watchedReleasedAttempts.add(attempt);
+    void attempt.then((error) => {
+      watchedReleasedAttempts.delete(attempt);
+      if (error === null) return;
+      // A newer successful close cannot erase an older outcome that had not
+      // settled yet. Re-open cleanup state and autonomously create a bounded
+      // reconciliation generation so the late failure is not suppression-only.
+      lateFailureGeneration += 1;
+      runtimeClosed = false;
+      scheduleLateFailureReconciliation();
+    });
+  };
+
+  async function closeRuntime(input: { reason: string }): Promise<void> {
+    if (runtimeClosed) return;
+    if (!runtimeCloseAttempt) {
+      // A close can reconcile only failures already known when its protocol
+      // attempt begins. A released older attempt may reject while this one is
+      // in flight; that later generation must trigger a subsequent close.
+      runtimeCloseAttemptReconciliationGeneration = lateFailureGeneration;
+      runtimeCloseAttempt = runtimeCloseOutcome(runtime, handle, input.reason);
+    }
+    const observedAttempt = runtimeCloseAttempt;
+    const observedReconciliationGeneration =
+      runtimeCloseAttemptReconciliationGeneration;
+    const processCleanup = terminateChildrenAfterCloseBound(
+      observedAttempt,
+      children,
+      runtimeCloseTimeoutMs,
+    );
+    // The caller may stop waiting, but the exact ACPX protocol cleanup stays
+    // owned until it settles. Provider termination proceeds at the deadline;
+    // after this bounded observation finishes a later close may make a fresh
+    // protocol attempt instead of inheriting a permanently pending promise.
+    const [closeError, processErrors] = await Promise.all([
+      boundedCloseOutcome(observedAttempt, runtimeCloseTimeoutMs),
+      processCleanup,
+    ]);
+    if (closeError instanceof AcpxRuntimeCloseTimeoutError) {
+      watchReleasedAttempt(observedAttempt);
+    }
+    if (runtimeCloseAttempt === observedAttempt) {
+      runtimeCloseAttempt = undefined;
+    }
+    if (processErrors.length === 0 && closeError === null) {
+      reconciledLateFailureGeneration = Math.max(
+        reconciledLateFailureGeneration,
+        observedReconciliationGeneration,
+      );
+      runtimeClosed = !hasUnreconciledLateFailure();
+    } else {
+      runtimeClosed = false;
+    }
+    scheduleLateFailureReconciliation();
+    if (closeError !== null || processErrors.length > 0) {
+      const errors = [closeError, ...processErrors].filter(
+        (error): error is unknown => error !== null,
+      );
+      throw new AggregateError(
+        errors,
+        "ACPX runtime and provider cleanup failed",
+      );
+    }
+  }
+
+  const port: AcpxRuntimePort = {
     async identity() {
       return structuredClone(identity);
     },
@@ -379,52 +520,85 @@ function runtimePort(
         ...(input.signal ? { signal: input.signal } : {}),
       });
     },
-    async close(input) {
-      const closeError = await closeRuntimeWithin(runtime, {
-        input: {
-          handle,
-          reason: input.reason,
-          discardPersistentState: false,
-        },
-        timeoutMs: runtimeCloseTimeoutMs,
-      });
-      const processErrors = await children.terminate();
-      if (closeError !== undefined || processErrors.length > 0) {
-        const errors = [...processErrors];
-        if (closeError !== undefined) errors.unshift(closeError);
-        throw new AggregateError(
-          errors,
-          "ACPX runtime and provider cleanup failed",
-        );
-      }
-    },
+    close: closeRuntime,
   };
+  return port;
 }
 
-async function closeRuntimeWithin(
+async function boundedRuntimeClose(
   runtime: AcpRuntime,
-  options: {
-    input: Parameters<AcpRuntime["close"]>[0];
-    timeoutMs: number;
-  },
-): Promise<unknown | undefined> {
-  const timeoutMs = Math.max(1, options.timeoutMs);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const closeOutcome = Promise.resolve()
-    .then(() => runtime.close(options.input))
+  handle: AcpRuntimeHandle,
+  reason: string,
+  timeoutMs: number,
+): Promise<unknown | null> {
+  return await boundedCloseOutcome(
+    runtimeCloseOutcome(runtime, handle, reason),
+    timeoutMs,
+  );
+}
+
+function runtimeCloseOutcome(
+  runtime: AcpRuntime,
+  handle: AcpRuntimeHandle,
+  reason: string,
+): Promise<unknown | null> {
+  const cleanup = Promise.resolve()
+    .then(() =>
+      runtime.close({ handle, reason, discardPersistentState: false }),
+    )
     .then(
-      () => undefined,
+      () => null,
       (error: unknown) => error,
     );
-  const timeoutOutcome = new Promise<Error>((resolve) => {
-    timer = setTimeout(
-      () => resolve(new Error("ACPX runtime close timed out")),
-      timeoutMs,
-    );
-  });
-  const outcome = await Promise.race([closeOutcome, timeoutOutcome]);
-  if (timer !== undefined) clearTimeout(timer);
-  return outcome;
+  return retainRuntimeCleanupOwner(cleanup);
+}
+
+function retainRuntimeCleanupOwner<T>(cleanup: Promise<T>): Promise<T> {
+  activeRuntimeCleanupOwners.add(cleanup);
+  void cleanup
+    .finally(() => activeRuntimeCleanupOwners.delete(cleanup))
+    .catch(() => undefined);
+  return cleanup;
+}
+
+async function terminateChildrenAfterCloseBound(
+  closeOutcome: Promise<unknown | null>,
+  children: SpawnedChildSet,
+  timeoutMs: number,
+): Promise<unknown[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      closeOutcome.then(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(1, Math.floor(timeoutMs)));
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return await children.terminate();
+}
+
+async function boundedCloseOutcome(
+  closeOutcome: Promise<unknown | null>,
+  timeoutMs: number,
+): Promise<unknown | null> {
+  const boundedTimeoutMs = Math.max(1, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    closeOutcome.then((error) => ({ error })),
+    new Promise<{ error: unknown }>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ error: new AcpxRuntimeCloseTimeoutError() }),
+        boundedTimeoutMs,
+      );
+      timer.unref();
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return outcome.error;
 }
 
 class SpawnedChildSet {
@@ -457,7 +631,7 @@ class SpawnedChildSet {
           const terminateOutcome = await signalAndWaitForExit(
             child,
             "SIGTERM",
-            2_000,
+            PROVIDER_TERM_EXIT_TIMEOUT_MS,
           );
           if (terminateOutcome.error !== undefined) {
             pushUnique(errors, terminateOutcome.error);
@@ -466,7 +640,7 @@ class SpawnedChildSet {
             const killOutcome = await signalAndWaitForExit(
               child,
               "SIGKILL",
-              2_000,
+              PROVIDER_KILL_EXIT_TIMEOUT_MS,
             );
             if (killOutcome.error !== undefined) {
               pushUnique(errors, killOutcome.error);
