@@ -1002,7 +1002,7 @@ describe("Codex ACPX runtime adapter", () => {
     });
   });
 
-  it("retries retained admission cleanup after the first close times out", async () => {
+  it("retains a timed-out admission close without starting a concurrent retry", async () => {
     let rejectHandshake: ((error: Error) => void) | undefined;
     const blockedHandshake = new Promise<AcpRuntimeHandle>(
       (_resolve, reject) => {
@@ -1010,10 +1010,13 @@ describe("Codex ACPX runtime adapter", () => {
       },
     );
     const runtime = fakeRuntime();
+    let settleClose!: () => void;
+    const pendingClose = new Promise<void>((resolve) => {
+      settleClose = resolve;
+    });
+    const retainedCleanups: Promise<void>[] = [];
     vi.mocked(runtime.ensureSession).mockReturnValue(blockedHandshake);
-    vi.mocked(runtime.close)
-      .mockImplementationOnce(() => new Promise<void>(() => undefined))
-      .mockResolvedValueOnce(undefined);
+    vi.mocked(runtime.close).mockReturnValue(pendingClose);
     const controller = new AbortController();
     const cancellation = new Error("runtime admission cancelled");
     let runtimeOptions: AcpRuntimeOptions | undefined;
@@ -1031,6 +1034,7 @@ describe("Codex ACPX runtime adapter", () => {
           return runtime;
         },
         runtimeCloseTimeoutMs: 5,
+        retainCleanup: (cleanup) => retainedCleanups.push(cleanup),
       },
     );
     await vi.waitFor(() =>
@@ -1046,12 +1050,20 @@ describe("Codex ACPX runtime adapter", () => {
       cwd: "/workspace",
     } as never);
 
-    await expect(opening).rejects.toBe(cancellation);
-    expect(runtime.close).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(runtime.close).mock.calls[1]?.[0]).toEqual(
-      vi.mocked(runtime.close).mock.calls[0]?.[0],
-    );
+    await expect(opening).rejects.toMatchObject({
+      errors: [
+        cancellation,
+        expect.objectContaining({ name: "AcpxRuntimeCloseTimeoutError" }),
+      ],
+    });
+    expect(runtime.close).toHaveBeenCalledOnce();
+    expect(retainedCleanups).toHaveLength(2);
+
+    settleClose();
+    await expect(retainedCleanups[1]).resolves.toBeUndefined();
+    expect(runtime.close).toHaveBeenCalledOnce();
     rejectHandshake?.(new Error("test handshake stopped"));
+    await expect(retainedCleanups[0]).resolves.toBeUndefined();
   });
 
   it("surfaces the retry error when both retained admission closes fail", async () => {
