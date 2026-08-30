@@ -143,9 +143,11 @@ impl AcpxProviderState {
     ) -> Result<Vec<AcpxProviderStateEvent>, LocalRunnerError> {
         let payload = decode_acpx_event(&self.scope, event)?;
         match payload {
-            AcpxEventPayload::Runtime { kind, payload } => {
-                self.accept_runtime_event(event, kind, payload)
-            }
+            AcpxEventPayload::Runtime {
+                kind,
+                tool_operation,
+                payload,
+            } => self.accept_runtime_event(event, kind, tool_operation, payload),
             AcpxEventPayload::PermissionRequested {
                 request_id,
                 kind,
@@ -311,6 +313,7 @@ impl AcpxProviderState {
         &mut self,
         event: &AcpxSidecarEvent,
         kind: AcpxRuntimeEventKind,
+        tool_operation: Option<&'static str>,
         payload: Value,
     ) -> Result<Vec<AcpxProviderStateEvent>, LocalRunnerError> {
         if kind == AcpxRuntimeEventKind::Thinking {
@@ -372,6 +375,7 @@ impl AcpxProviderState {
         Ok(normalize_acpx_runtime_event(
             kind,
             &payload,
+            tool_operation,
             &fallback_item_id,
             turn_id,
             self.provider_requests,
