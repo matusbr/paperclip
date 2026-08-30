@@ -1131,14 +1131,7 @@ async function syncDirectory(directory: string): Promise<void> {
         () => handle.close().catch(() => undefined),
         () => handle.close().catch(() => undefined),
       );
-      pendingDirectorySyncCleanups.set(directory, cleanupAttempt);
-      void cleanupAttempt
-        .finally(() => {
-          if (pendingDirectorySyncCleanups.get(directory) === cleanupAttempt) {
-            pendingDirectorySyncCleanups.delete(directory);
-          }
-        })
-        .catch(() => undefined);
+      retainDirectorySyncCleanup(directory, cleanupAttempt);
     }
     throw error;
   } finally {
@@ -1157,15 +1150,43 @@ async function closeDirectoryHandle(
     const closeAttempt = handle.close();
     try {
       await waitForDirectorySyncOperation(closeAttempt, "close", directory);
-    } catch {
+    } catch (error) {
       // close(2) cannot be cancelled. Keep observing a late rejection without
-      // holding credential admission, cleanup, or the process open.
-      void closeAttempt.catch(() => undefined);
+      // leaking additional directory handles. Admission remains closed until
+      // the real close settles, while a completed fsync stays successful.
+      if (error instanceof DirectorySyncOperationTimeoutError) {
+        retainDirectorySyncCleanup(directory, closeAttempt);
+      } else {
+        void closeAttempt.catch(() => undefined);
+      }
     }
   } catch {
     // Closing cannot invalidate an fsync that already completed, and callers
     // with a failed fsync must retain that original durability error.
   }
+}
+
+function retainDirectorySyncCleanup(
+  directory: string,
+  attempt: Promise<unknown>,
+): void {
+  const observed = attempt.then(
+    () => undefined,
+    () => undefined,
+  );
+  const prior = pendingDirectorySyncCleanups.get(directory);
+  const barrier =
+    prior === undefined
+      ? observed
+      : Promise.allSettled([prior, observed]).then(() => undefined);
+  pendingDirectorySyncCleanups.set(directory, barrier);
+  void barrier
+    .finally(() => {
+      if (pendingDirectorySyncCleanups.get(directory) === barrier) {
+        pendingDirectorySyncCleanups.delete(directory);
+      }
+    })
+    .catch(() => undefined);
 }
 
 class DirectorySyncOperationTimeoutError extends Error {

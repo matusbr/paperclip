@@ -786,12 +786,12 @@ describe("managed Codex credentials", () => {
       );
       let directoryCloseAttempts = 0;
       let observeFirstClose!: () => void;
-      let observeLeaseClose!: () => void;
+      let settleFirstClose!: () => void;
       const firstClose = new Promise<void>((resolveClose) => {
         observeFirstClose = resolveClose;
       });
-      const leaseClose = new Promise<void>((resolveClose) => {
-        observeLeaseClose = resolveClose;
+      const retainedClose = new Promise<void>((resolveClose) => {
+        settleFirstClose = resolveClose;
       });
       vi.doMock("node:fs/promises", () => ({
         ...actualFs,
@@ -804,9 +804,10 @@ describe("managed Codex credentials", () => {
             return {
               close: async (): Promise<void> => {
                 directoryCloseAttempts += 1;
-                if (directoryCloseAttempts === 1) observeFirstClose();
-                if (directoryCloseAttempts === 3) observeLeaseClose();
-                return await new Promise<void>(() => undefined);
+                if (directoryCloseAttempts === 1) {
+                  observeFirstClose();
+                  return await retainedClose;
+                }
               },
               sync: async (): Promise<void> => undefined,
             } as FileHandle;
@@ -826,11 +827,15 @@ describe("managed Codex credentials", () => {
       await vi.advanceTimersByTimeAsync(20_000);
       const lease = await staging;
 
-      const closing = lease.close();
-      await leaseClose;
+      await expect(lease.close()).rejects.toThrow(
+        "remained non-durable after 1 attempt",
+      );
+      expect(directoryCloseAttempts).toBe(1);
+
+      settleFirstClose();
       await vi.advanceTimersByTimeAsync(20_000);
-      await closing;
-      expect(directoryCloseAttempts).toBe(4);
+      await expect(lease.close()).resolves.toBeUndefined();
+      expect(directoryCloseAttempts).toBeGreaterThan(1);
     },
   );
 
