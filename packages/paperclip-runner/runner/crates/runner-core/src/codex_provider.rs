@@ -15,6 +15,7 @@ const MAX_BUFFERED_MESSAGES: usize = 1_024;
 const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_TOOL_REQUESTS: usize = 4_096;
 const MAX_PENDING_TOOL_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COMPLETED_TOOL_CALL_IDS: usize = 4_096;
 type QuestionOptionLabels = BTreeMap<String, BTreeMap<String, String>>;
 type QuestionSetMapping = (String, Value, QuestionOptionLabels);
 
@@ -185,6 +186,7 @@ pub struct CodexProvider {
     deferred_ambiguous_messages: VecDeque<BufferedProviderMessage>,
     authorized_tool_ids: BTreeSet<String>,
     pending_tool_requests: BTreeMap<String, PendingToolRequest>,
+    completed_tool_call_ids: BTreeSet<String>,
     pending_tool_request_bytes: usize,
     pending_runtime_requests: BTreeMap<String, PendingRuntimeRequest>,
     expected_shutdown: bool,
@@ -251,6 +253,7 @@ impl CodexProvider {
             deferred_ambiguous_messages: VecDeque::new(),
             authorized_tool_ids,
             pending_tool_requests: BTreeMap::new(),
+            completed_tool_call_ids: BTreeSet::new(),
             pending_tool_request_bytes: 0,
             pending_runtime_requests: BTreeMap::new(),
             expected_shutdown: false,
@@ -491,6 +494,7 @@ impl CodexProvider {
         self.expected_shutdown = false;
         self.completed_turn_authority = None;
         self.completion_reconciliation_pending = false;
+        self.completed_tool_call_ids.clear();
         self.active_provider_turn_id = Some(provider_turn_id);
     }
 
@@ -587,7 +591,10 @@ impl CodexProvider {
                         // but the durable terminal reconciles it instead of
                         // allowing the session to fail retroactively. Fresh
                         // turn work explicitly revokes the prior authority.
+                        // An unresolved start may already have created fresh
+                        // work, so even a clean exit must fail that session.
                         success: exit.success
+                            && !self.ambiguous_turn_start_pending
                             && (self.expected_shutdown || completed_turn_authoritative),
                         completed_turn_authoritative,
                         completed_turn_observed_by_process,
@@ -712,6 +719,11 @@ impl CodexProvider {
                     input: input.clone(),
                     retained_bytes,
                 };
+                if self.completed_tool_call_ids.contains(&call_id) {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex reused a completed tool call id",
+                    ));
+                }
                 if let Some(existing) = self.pending_tool_requests.get(&call_id) {
                     if existing != &pending {
                         return Err(LocalRunnerError::invalid(
@@ -732,6 +744,11 @@ impl CodexProvider {
                 if self.pending_tool_requests.len() >= MAX_PENDING_TOOL_REQUESTS {
                     return Err(LocalRunnerError::invalid(
                         "Codex emitted too many pending tool calls",
+                    ));
+                }
+                if self.completed_tool_call_ids.len() >= MAX_COMPLETED_TOOL_CALL_IDS {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex emitted too many completed tool calls in one turn",
                     ));
                 }
                 let retained_request_bytes = retain_pending_tool_request_bytes(
@@ -823,6 +840,7 @@ impl CodexProvider {
                 // a provider that already closed stdin must not turn the
                 // completed turn back into a transport failure.
                 let _ = self.cancel_pending_requests();
+                self.completed_tool_call_ids.clear();
             }
             return Ok(Some(CodexProviderEvent::Notification {
                 method: method.to_owned(),
@@ -866,6 +884,7 @@ impl CodexProvider {
             self.pending_tool_request_bytes = self
                 .pending_tool_request_bytes
                 .saturating_sub(completed.retained_bytes);
+            self.completed_tool_call_ids.insert(result.call_id.clone());
         }
         Ok(())
     }

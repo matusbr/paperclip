@@ -127,6 +127,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let call_log = argument(&args, "--call-log").map(PathBuf::from);
     let emit_question = args.iter().any(|value| value == "--emit-question");
     let emit_tool_call = args.iter().any(|value| value == "--emit-tool-call");
+    let replay_completed_tool_call = args
+        .iter()
+        .any(|value| value == "--replay-completed-tool-call");
     let complete_after_tool_call = args
         .iter()
         .any(|value| value == "--complete-after-tool-call");
@@ -163,6 +166,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let fail_after_accepting_second_turn_before_response = args
         .iter()
         .any(|value| value == "--fail-after-accepting-second-turn-before-response");
+    let exit_after_accepting_second_turn_before_response = args
+        .iter()
+        .any(|value| value == "--exit-after-accepting-second-turn-before-response");
     let complete_ambiguous_second_turn = args
         .iter()
         .any(|value| value == "--complete-ambiguous-second-turn");
@@ -218,6 +224,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let result: Value = serde_json::from_str(text)?;
             if result != json!({"ok": true, "task": {"id": "task-1"}}) {
                 return Err("semantic tool response changed the operation result".into());
+            }
+            if replay_completed_tool_call {
+                send(json!({
+                    "id": "tool-request-replay",
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                        "callId": "semantic-call-1",
+                        "tool": "get_task_context",
+                        "arguments": {}
+                    }
+                }))?;
+                continue;
             }
             finish_turn(&state_path, &mut state, "completed")?;
             continue;
@@ -330,6 +350,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         )?;
                     }
                     return Err("configured failure after accepting second turn".into());
+                }
+                if exit_after_accepting_second_turn_before_response && turn_start_count == 2 {
+                    return Ok(());
                 }
                 if malformed_error_second_turn_start && turn_start_count == 2 {
                     send(json!({"id": id, "error": {}}))?;

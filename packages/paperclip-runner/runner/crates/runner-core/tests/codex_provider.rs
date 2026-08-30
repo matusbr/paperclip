@@ -195,6 +195,56 @@ fn codex_dynamic_tool_round_trips_through_the_provider_boundary() {
 }
 
 #[test]
+fn codex_rejects_replay_of_a_completed_tool_call_id_in_the_same_turn() {
+    let directory = temporary_directory("completed-tool-call-replay");
+    let config = provider_config(
+        &directory,
+        &[
+            "--require-dynamic-tool",
+            "--emit-tool-call",
+            "--replay-completed-tool-call",
+        ],
+    );
+    let mut provider = CodexProvider::start_with_tools(&config, [task_context_tool()], None)
+        .expect("start Codex with an authorized tool");
+    provider
+        .start_turn("Inspect the fake task once.", &config.cwd)
+        .expect("start provider turn");
+
+    let first_call = (0..32)
+        .find_map(|_| match provider.poll().expect("poll first tool call") {
+            Some(CodexProviderEvent::ToolCall {
+                call_id,
+                operation_id,
+                ..
+            }) => Some((call_id, operation_id)),
+            _ => None,
+        })
+        .expect("observe the first semantic tool call");
+    provider
+        .deliver_tool_result(&ToolResult {
+            call_id: first_call.0,
+            operation_id: first_call.1,
+            result: json!({"ok": true, "task": {"id": "task-1"}}),
+            is_error: false,
+        })
+        .expect("deliver the first semantic result");
+
+    let replay_error = (0..32)
+        .find_map(|_| provider.poll().err())
+        .expect("same-turn replay of the completed call id is rejected");
+    assert!(
+        replay_error
+            .to_string()
+            .contains("reused a completed tool call id"),
+        "unexpected replay error: {replay_error}"
+    );
+
+    let _ = provider.shutdown();
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
 fn codex_completion_cancels_pending_tool_request_before_releasing_capacity() {
     let directory = temporary_directory("completed-tool-call");
     let config = provider_config(
@@ -499,7 +549,9 @@ fn post_completion_observation_does_not_hide_same_or_resumed_process_failure() {
                 .map(|event| event.event_type),
         );
         if event_types.iter().any(|event| event == "turn.completed")
-            && event_types.iter().any(|event| event == "provider.notice.recorded")
+            && event_types
+                .iter()
+                .any(|event| event == "provider.notice.recorded")
             && event_types.iter().any(|event| event == "session.failed")
         {
             break;
@@ -939,11 +991,11 @@ fn ambiguous_replacement_turn_rejects_conflicting_later_identity() {
 }
 
 #[test]
-fn ambiguous_replacement_start_preserves_durable_exit_authority() {
-    let directory = temporary_directory("durable-ambiguous-turn-start");
+fn clean_exit_after_ambiguous_replacement_start_fails_the_durable_session() {
+    let directory = temporary_directory("durable-clean-exit-after-ambiguous-turn-start");
     let config = provider_config(
         &directory,
-        &["--fail-after-accepting-second-turn-before-response"],
+        &["--exit-after-accepting-second-turn-before-response"],
     );
     let mut executor = CodexCommandExecutor::new(&directory);
     executor
@@ -985,7 +1037,7 @@ fn ambiguous_replacement_start_preserves_durable_exit_authority() {
             "ambiguous-turn",
             4,
             "turn.start",
-            json!({"text": "Accept replacement work before crashing."}),
+            json!({"text": "Accept replacement work before exiting cleanly."}),
         ))
         .expect_err("accepted replacement start loses its response");
     let persisted_after_start: Value = serde_json::from_slice(
