@@ -1437,7 +1437,7 @@ describe("Codex ACPX harness driver", () => {
     });
   });
 
-  it("keeps completed result ownership when an identical retry fails", async () => {
+  it("rejects recovery when an identical retry fails after a completed result", async () => {
     const fixture = driverFixture();
     const session = await fixture.driver.openSession({
       runId: "run-failed-semantic-reaffirmation",
@@ -1496,12 +1496,15 @@ describe("Codex ACPX harness driver", () => {
     });
     await session.close({ reason: "simulate failed reaffirmation recovery" });
 
-    await expect(fixture.driver.recoverSession!(snapshot)).resolves.toMatchObject({
-      recovered: true,
+    await expect(fixture.driver.recoverSession!(snapshot)).resolves.toEqual({
+      recovered: false,
+      reason:
+        "persisted Codex ACPX semantic result is not the latest terminal settlement",
     });
+    expect(fixture.readRecoveryWorkspace).not.toHaveBeenCalled();
   });
 
-  it("keeps completed result ownership when close interrupts an identical retry", async () => {
+  it("rejects recovery when close interrupts an identical retry", async () => {
     const fixture = driverFixture({}, { closeSettlementTimeoutMs: 1 });
     const session = await fixture.driver.openSession({
       runId: "run-close-interrupted-semantic-reaffirmation",
@@ -1552,9 +1555,12 @@ describe("Codex ACPX harness driver", () => {
     });
 
     fixture.finishTurn({ status: "cancelled", stopReason: "session_closed" });
-    await expect(fixture.driver.recoverSession!(snapshot)).resolves.toMatchObject({
-      recovered: true,
+    await expect(fixture.driver.recoverSession!(snapshot)).resolves.toEqual({
+      recovered: false,
+      reason:
+        "persisted Codex ACPX semantic result is not the latest terminal settlement",
     });
+    expect(fixture.readRecoveryWorkspace).not.toHaveBeenCalled();
   });
 
   it("does not transfer a failed turn's semantic result to an unrelated resultless turn", async () => {

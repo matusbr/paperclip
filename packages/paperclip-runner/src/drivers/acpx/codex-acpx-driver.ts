@@ -1468,17 +1468,7 @@ function validateRecoverySnapshot(snapshot: PersistedHarnessSession): void {
         "persisted Codex ACPX semantic result has no completed terminal turn",
       );
     }
-    if (
-      terminalTurns.at(-1)?.turnId !== semantic.turnId &&
-      !terminalTurns
-        .slice(semanticTerminalIndex + 1)
-        .every((terminal) =>
-          isUnsuccessfulSemanticReaffirmation(
-            terminal.fingerprint,
-            semantic.fingerprint,
-          ),
-        )
-    ) {
+    if (terminalTurns.at(-1)?.turnId !== semantic.turnId) {
       throw new Error(
         "persisted Codex ACPX semantic result is not the latest terminal settlement",
       );
@@ -1528,25 +1518,6 @@ function isCompletedTerminal(terminalFingerprint: string): boolean {
       && value !== null
       && !Array.isArray(value)
       && (value as Record<string, unknown>).status === "completed";
-  } catch {
-    return false;
-  }
-}
-
-function isUnsuccessfulSemanticReaffirmation(
-  terminalFingerprint: string,
-  semanticFingerprint: string,
-): boolean {
-  try {
-    const value: unknown = JSON.parse(terminalFingerprint);
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      return false;
-    }
-    const terminal = value as Record<string, unknown>;
-    return (
-      (terminal.status === "failed" || terminal.status === "interrupted") &&
-      terminal.reaffirmedSemanticResult === semanticFingerprint
-    );
   } catch {
     return false;
   }
