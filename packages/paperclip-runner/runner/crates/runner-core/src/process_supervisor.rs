@@ -308,9 +308,11 @@ impl SupervisedProcess {
                 }
                 Ok(ProcessOutput::StdoutClosed) => return Ok(None),
                 Err(RecvTimeoutError::Timeout) => return Ok(None),
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(LocalRunnerError::invalid("process output channel closed"));
-                }
+                // The reader threads end when the child closes its output.
+                // Let the caller reconcile that closure with the authoritative
+                // process exit status instead of turning the channel teardown
+                // into a transport failure.
+                Err(RecvTimeoutError::Disconnected) => return Ok(None),
             }
         }
     }
