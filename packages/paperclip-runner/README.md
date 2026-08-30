@@ -98,6 +98,9 @@ and reduce polled events through the scope-first state boundary. A mismatched
 command acknowledgement or invalid event terminates the session fail closed.
 Polled semantic calls pass through the run-scoped authorized tool bridge before
 they can be returned to a caller.
+The Rust question-response validator checks the versioned response envelope
+against the exact persisted question IDs, answer modes, options, required
+answers, custom-answer policy, and text constraints before provider delivery.
 
 Run the complete contract gate with:
 
