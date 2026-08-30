@@ -15,7 +15,7 @@ import {
   type Server,
   type Socket,
 } from "node:net";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 const MAX_CODEX_CREDENTIAL_BYTES = 256 * 1024;
 const PRIVATE_FILE_MODE = 0o600;
@@ -36,6 +36,8 @@ const MAX_CREDENTIAL_LEASE_MARKERS = 1_024;
 
 interface CredentialHomeLock {
   assertHeld(): void;
+  inheritanceFd(): number;
+  activateLifetimeOwner(pid: number): Promise<void>;
   release(): Promise<void>;
 }
 
@@ -87,6 +89,13 @@ export type ManagedCodexCredentialMode =
 export interface ManagedCodexCredentialLease {
   readonly path: string;
   readonly mode: ManagedCodexCredentialMode;
+  /**
+   * Duplicate this kernel-owned listener into the provider lifetime sentinel.
+   * The sentinel keeps the home fenced if the Node owner dies abruptly.
+   */
+  readonly lifetimeFenceFd: number;
+  /** Durably bind the cross-process lease marker to its provider guardian. */
+  activateLifetimeOwner(pid: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -121,7 +130,10 @@ export async function stageManagedCodexCredential(input: {
       lock,
     );
   } catch (error) {
-    if (lock !== null && quarantinedCredentialCleanups.get(home)?.lock !== lock) {
+    if (
+      lock !== null &&
+      quarantinedCredentialCleanups.get(home)?.lock !== lock
+    ) {
       await lock.release().catch(() => undefined);
     }
     releaseCredentialLeaseGeneration(home, ownerGeneration);
@@ -393,6 +405,9 @@ async function acquireCredentialHomeLock(
 
   let released = false;
   let releaseAttempt: Promise<void> | null = null;
+  let ownerActivation: Promise<void> | null = null;
+  let activeOwnerPid = process.pid;
+  const inheritanceFd = credentialLeaseServerFd(server);
   return Object.freeze({
     assertHeld(): void {
       if (released || invalid !== null || !server.listening) {
@@ -401,10 +416,37 @@ async function acquireCredentialHomeLock(
         });
       }
     },
+    inheritanceFd(): number {
+      this.assertHeld();
+      return inheritanceFd;
+    },
+    async activateLifetimeOwner(pid: number): Promise<void> {
+      this.assertHeld();
+      if (!Number.isSafeInteger(pid) || pid < 1) {
+        throw new Error("Managed Codex credential lifetime owner is invalid");
+      }
+      if (activeOwnerPid === pid) return;
+      if (ownerActivation !== null) return await ownerActivation;
+      const activation = replaceCredentialLeaseMarker(markerPath, home, {
+        version: 1,
+        identity,
+        pid,
+        port,
+        token: markerToken(markerPath),
+      });
+      ownerActivation = activation;
+      try {
+        await activation;
+        activeOwnerPid = pid;
+      } finally {
+        if (ownerActivation === activation) ownerActivation = null;
+      }
+    },
     async release(): Promise<void> {
       if (released) return;
       if (releaseAttempt !== null) return await releaseAttempt;
       const attempt = (async () => {
+        await ownerActivation?.catch(() => undefined);
         const ownershipError = invalid;
         // Keep the kernel fence live until its marker is gone. If unlinking
         // the marker fails, quarantine recovery can still assert ownership
@@ -583,7 +625,9 @@ async function readCredentialLeaseMarker(
       return null;
     }
     const bytes = await readHandle(handle, metadata.size);
-    const value = JSON.parse(bytes.toString("utf8")) as Partial<CredentialLeaseMarker>;
+    const value = JSON.parse(
+      bytes.toString("utf8"),
+    ) as Partial<CredentialLeaseMarker>;
     if (
       value.version !== 1 ||
       typeof value.identity !== "string" ||
@@ -634,6 +678,48 @@ async function publishCredentialLeaseMarker(
   return markerPath;
 }
 
+async function replaceCredentialLeaseMarker(
+  markerPath: string,
+  home: string,
+  marker: CredentialLeaseMarker,
+): Promise<void> {
+  const temporaryPath = join(
+    home,
+    `.paperclip-auth-lease-owner-${randomBytes(16).toString("hex")}.tmp`,
+  );
+  const handle = await open(
+    temporaryPath,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_EXCL |
+      (constants.O_NOFOLLOW ?? 0),
+    PRIVATE_FILE_MODE,
+  );
+  try {
+    await handle.writeFile(`${JSON.stringify(marker)}\n`, "utf8");
+    await handle.sync();
+    await handle.close();
+    await rename(temporaryPath, markerPath);
+    await syncDirectory(home);
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+function markerToken(markerPath: string): string {
+  const name = basename(markerPath);
+  const token = name.slice(
+    CREDENTIAL_LEASE_MARKER_PREFIX.length,
+    -".json".length,
+  );
+  if (!/^[0-9a-f]{32}$/.test(token)) {
+    throw new Error("Managed Codex credential lease marker is malformed");
+  }
+  return token;
+}
+
 function credentialLeaseProcessIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -653,6 +739,16 @@ async function credentialLeasePortIsOccupied(port: number): Promise<boolean> {
     if (errorCode(error) === "EADDRINUSE") return true;
     throw error;
   }
+}
+
+function credentialLeaseServerFd(server: Server): number {
+  const fd = (server as Server & { _handle?: { fd?: unknown } })._handle?.fd;
+  if (!Number.isSafeInteger(fd) || (fd as number) < 0) {
+    throw new Error(
+      "Managed Codex credential ownership listener cannot be inherited",
+    );
+  }
+  return fd as number;
 }
 
 async function listenForCredentialLease(
@@ -722,10 +818,7 @@ function startCredentialCleanupRecovery(
         cleanup.lock.assertHeld();
         await removeReplaceableCredential(cleanup.path);
         await syncDirectory(cleanup.home);
-        await removeCredentialCleanupIntent(
-          cleanup.intentPath,
-          cleanup.home,
-        );
+        await removeCredentialCleanupIntent(cleanup.intentPath, cleanup.home);
         await cleanup.lock.release();
         quarantinedCredentialCleanups.delete(cleanup.home);
         return;
@@ -740,9 +833,11 @@ function startCredentialCleanupRecovery(
     }
   })();
   cleanup.recovery = recovery;
-  void recovery.finally(() => {
-    if (cleanup.recovery === recovery) cleanup.recovery = null;
-  }).catch(() => undefined);
+  void recovery
+    .finally(() => {
+      if (cleanup.recovery === recovery) cleanup.recovery = null;
+    })
+    .catch(() => undefined);
   return recovery;
 }
 
@@ -786,13 +881,29 @@ function credentialLease(
   lock.assertHeld();
   let closed = false;
   let closeAttempt: Promise<void> | null = null;
+  let lifetimeOwnerAttempt: Promise<void> | null = null;
   return Object.freeze({
     path,
     mode,
+    lifetimeFenceFd: lock.inheritanceFd(),
+    async activateLifetimeOwner(pid: number): Promise<void> {
+      if (closed || closeAttempt !== null) {
+        throw new Error("Managed Codex credential lease is closing");
+      }
+      if (lifetimeOwnerAttempt !== null) return await lifetimeOwnerAttempt;
+      const attempt = lock.activateLifetimeOwner(pid);
+      lifetimeOwnerAttempt = attempt;
+      try {
+        await attempt;
+      } finally {
+        if (lifetimeOwnerAttempt === attempt) lifetimeOwnerAttempt = null;
+      }
+    },
     async close(): Promise<void> {
       if (closed) return;
       if (closeAttempt !== null) return await closeAttempt;
       const attempt = (async () => {
+        await lifetimeOwnerAttempt?.catch(() => undefined);
         const activeGeneration = activeCredentialLeaseGenerations.get(home);
         if (activeGeneration !== ownerGeneration) {
           // A failed close releases its generation only after publishing a

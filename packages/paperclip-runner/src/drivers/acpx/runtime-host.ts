@@ -43,6 +43,15 @@ import {
 import type { AcpxExpectedSessionIdentity } from "./sidecar-protocol.js";
 
 export const ACPX_TURN_CANCELLATION_SHUTDOWN_BOUND_MS = 2_000;
+const RUNTIME_ADMISSION_VERIFICATION_TIMEOUT_MS = 8_000;
+const activeRuntimeHostCleanupOwners = new Set<Promise<unknown>>();
+
+class AcpxRuntimeAdmissionTimeoutError extends Error {
+  constructor() {
+    super("ACPX runtime admission verification exceeded its deadline");
+    this.name = "AcpxRuntimeAdmissionTimeoutError";
+  }
+}
 
 const ACPX_ADMISSION_CLEANUP_BATCH_ATTEMPTS = 8;
 const ACPX_ADMISSION_CLEANUP_RETRY_DELAY_MS = 10;
@@ -88,6 +97,10 @@ export interface AcpxRuntimePortOpenOptions {
   permissionMode: NativeAcpxPermissionMode;
   permissionPolicy: ReturnType<typeof acpxRuntimePermissionPolicy>;
   launchEnvironment: Readonly<NodeJS.ProcessEnv>;
+  /** Kernel credential-home fence inherited by the provider lifetime sentinel. */
+  credentialFenceFd: number | null;
+  /** Durably transfers the credential-home marker to the lifetime sentinel. */
+  activateCredentialFenceOwner: ((pid: number) => Promise<void>) | null;
   systemInstructions: string;
   /** Abort provider admission and clean any runtime that resolves too late. */
   signal?: AbortSignal;
@@ -110,6 +123,16 @@ export interface AcpxRuntimeHostDependencies {
   /** Internal test seam for aborting credential acquisition. */
   stageCredential?: typeof stageManagedCodexCredential;
   openRuntime(options: AcpxRuntimePortOpenOptions): Promise<AcpxRuntimePort>;
+  /** Internal test seam for the post-handshake admission deadline. */
+  admissionVerificationTimeoutMs?: number;
+  /** Internal test seam for failed-admission cleanup. */
+  admissionCleanupTimeoutMs?: number;
+  /**
+   * Transfers failed-admission cleanup ownership to the embedding lifecycle.
+   * The callback receives the exact aggregate cleanup attempt before the
+   * bounded admission wait can return.
+   */
+  retainAdmissionCleanup?: (cleanup: Promise<void>) => void;
 }
 
 export interface OpenAcpxRuntimeHostOptions {
@@ -128,7 +151,6 @@ export interface OpenAcpxRuntimeHostOptions {
   semanticTools?: AcpxSemanticToolSession;
 }
 
-const activeRuntimeHostCleanupOwners = new Set<Promise<unknown>>();
 // An aborted runtime admission that rejects with anything other than the exact
 // abort reason has not proved that its provider was reaped. Keep the managed
 // credential lease fenced for this process rather than letting a still-live
@@ -191,9 +213,8 @@ export class AcpxRuntimeHost {
   ): Promise<AcpxRuntimeHost> {
     options.signal?.throwIfAborted();
     const profile = resolveQualifiedAcpxProfile(options.agent, options.model);
-    const binding = await runAbortableAdmissionStage(
-      options.signal,
-      () => createAcpxRecoveryBinding({
+    const binding = await runAbortableAdmissionStage(options.signal, () =>
+      createAcpxRecoveryBinding({
         runtimeDirectory: options.runtimeDirectory,
         normalizedSessionId: options.normalizedSessionId,
         workingDirectory: options.workingDirectory,
@@ -214,11 +235,10 @@ export class AcpxRuntimeHost {
       );
     }
 
-    const installation = await runAbortableAdmissionStage(
-      options.signal,
-      () => (
-        dependencies.verifyInstallation ?? verifyQualifiedAcpxInstallation
-      )(profile),
+    const installation = await runAbortableAdmissionStage(options.signal, () =>
+      (dependencies.verifyInstallation ?? verifyQualifiedAcpxInstallation)(
+        profile,
+      ),
     );
     if (installation.commandDigest !== profile.commandDigest) {
       throw new Error("Verified ACPX installation does not match its profile");
@@ -228,10 +248,15 @@ export class AcpxRuntimeHost {
     let toolBridge: RunnerToolBridge | null = null;
     let runtime: AcpxRuntimePort | null = null;
     let pendingRuntimeOwnsCredential = false;
+    const admissionVerificationTimeoutMs =
+      dependencies.admissionVerificationTimeoutMs ??
+      RUNTIME_ADMISSION_VERIFICATION_TIMEOUT_MS;
+    const admissionCleanupTimeoutMs =
+      dependencies.admissionCleanupTimeoutMs ??
+      RUNTIME_ADMISSION_VERIFICATION_TIMEOUT_MS;
     try {
-      const sandbox = await runAbortableAdmissionStage(
-        options.signal,
-        () => prepareAcpxRuntimeSandbox({
+      const sandbox = await runAbortableAdmissionStage(options.signal, () =>
+        prepareAcpxRuntimeSandbox({
           binding,
           agent: options.agent,
           environment: options.environment,
@@ -240,13 +265,12 @@ export class AcpxRuntimeHost {
       if (options.agent === "codex") {
         credential = await acquireAbortableAdmissionResource({
           signal: options.signal,
-          acquire: () => (
-            dependencies.stageCredential ?? stageManagedCodexCredential
-          )({
-            agentHomeDirectory: sandbox.agentHomeDirectory,
-            environment: options.environment,
-            sourcePath: options.managedCodexCredentialSourcePath,
-          }),
+          acquire: () =>
+            (dependencies.stageCredential ?? stageManagedCodexCredential)({
+              agentHomeDirectory: sandbox.agentHomeDirectory,
+              environment: options.environment,
+              sourcePath: options.managedCodexCredentialSourcePath,
+            }),
           releaseLate: (lateCredential) => lateCredential.close(),
         });
       }
@@ -264,31 +288,40 @@ export class AcpxRuntimeHost {
         : null;
       runtime = await acquireAbortableAdmissionResource({
         signal: options.signal,
-        acquire: () => dependencies.openRuntime({
-          command: command!,
-          profile,
-          cwd: binding.workspacePath,
-          stateDirectory: sandbox.stateDirectory,
-          providerSessionKey: binding.profileSessionKey,
-          permissionMode: binding.permissionMode,
-          permissionPolicy: acpxRuntimePermissionPolicy(binding.permissionMode),
-          launchEnvironment: sandbox.launchEnvironment,
-          systemInstructions: boundedInstructions(options.systemInstructions),
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-          mcpServers: toolBridge
-            ? [
-                {
-                  name: "paperclip",
-                  url: toolBridge.url,
-                  bearerToken: toolBridge.secret,
-                  runnerOwned: true,
-                },
-              ]
-            : [],
-        }),
-        releaseLate: (lateRuntime) => lateRuntime.close({
-          reason: "ACPX runtime admission aborted",
-        }),
+        acquire: () =>
+          dependencies.openRuntime({
+            command: command!,
+            profile,
+            cwd: binding.workspacePath,
+            stateDirectory: sandbox.stateDirectory,
+            providerSessionKey: binding.profileSessionKey,
+            permissionMode: binding.permissionMode,
+            permissionPolicy: acpxRuntimePermissionPolicy(
+              binding.permissionMode,
+            ),
+            launchEnvironment: sandbox.launchEnvironment,
+            credentialFenceFd: credential?.lifetimeFenceFd ?? null,
+            activateCredentialFenceOwner:
+              typeof credential?.activateLifetimeOwner === "function"
+                ? credential.activateLifetimeOwner.bind(credential)
+                : null,
+            systemInstructions: boundedInstructions(options.systemInstructions),
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+            mcpServers: toolBridge
+              ? [
+                  {
+                    name: "paperclip",
+                    url: toolBridge.url,
+                    bearerToken: toolBridge.secret,
+                    runnerOwned: true,
+                  },
+                ]
+              : [],
+          }),
+        releaseLate: (lateRuntime) =>
+          lateRuntime.close({
+            reason: "ACPX runtime admission aborted",
+          }),
         onAbortedPending: (pendingRuntime) => {
           // A provider may already be running even though openRuntime has not
           // returned its port. Keep its credential lease with that exact
@@ -303,13 +336,14 @@ export class AcpxRuntimeHost {
           });
         },
       });
-      await runAbortableAdmissionStage(
-        options.signal,
-        () => requireVerifiedAcpxModel(runtime!, profile),
-      );
       const runtimeIdentity = await runAbortableAdmissionStage(
         options.signal,
-        () => runtime!.identity(),
+        () =>
+          boundedRuntimeAdmissionVerification(
+            runtime!,
+            profile,
+            admissionVerificationTimeoutMs,
+          ),
       );
       const observedIdentity: AcpxExpectedSessionIdentity = {
         kind: "acpx",
@@ -336,14 +370,16 @@ export class AcpxRuntimeHost {
         toolBridge,
       });
     } catch (error) {
-      const cleanupError = await cleanupRuntimeResources(
+      const cleanup = cleanupRuntimeResources(
         runtime,
         toolBridge,
         pendingRuntimeOwnsCredential ? null : credential,
         command,
         "ACPX runtime initialization failed",
       );
-      if (cleanupError) {
+      retainRuntimeHostCleanup(cleanup);
+      void cleanup.then((cleanupError) => {
+        if (!cleanupError) return;
         retainFailedAcpxAdmissionCleanup({
           runtime,
           toolBridge,
@@ -351,8 +387,30 @@ export class AcpxRuntimeHost {
           command,
           reason: "ACPX runtime initialization failed",
         });
+      });
+      dependencies.retainAdmissionCleanup?.(
+        cleanup.then((cleanupError) => {
+          if (cleanupError) throw cleanupError;
+        }),
+      );
+      const cleanupOutcome = await awaitRuntimeHostCleanupWithin(
+        cleanup,
+        admissionCleanupTimeoutMs,
+      );
+      if (cleanupOutcome === "deferred") {
         throw new AggregateError(
-          [error, ...cleanupError.errors],
+          [
+            error,
+            new Error(
+              "ACPX runtime initialization cleanup exceeded its shutdown timeout",
+            ),
+          ],
+          "ACPX runtime initialization and cleanup failed",
+        );
+      }
+      if (cleanupOutcome) {
+        throw new AggregateError(
+          [error, ...cleanupOutcome.errors],
           "ACPX runtime initialization and cleanup failed",
         );
       }
@@ -393,9 +451,7 @@ export class AcpxRuntimeHost {
       text,
       requestId,
       ...(input.signal ? { signal: input.signal } : {}),
-      ...(input.onElicitation
-        ? { onElicitation: input.onElicitation }
-        : {}),
+      ...(input.onElicitation ? { onElicitation: input.onElicitation } : {}),
     });
     this.#activeTurn = turn;
     void turn.result
@@ -531,13 +587,6 @@ function raceAdmissionWithAbort<T>(
   });
 }
 
-function retainRuntimeHostCleanup(cleanup: Promise<unknown>): void {
-  activeRuntimeHostCleanupOwners.add(cleanup);
-  void cleanup
-    .finally(() => activeRuntimeHostCleanupOwners.delete(cleanup))
-    .catch(() => undefined);
-}
-
 function retainAbortedRuntimeAdmissionCleanup(input: {
   pendingRuntime: Promise<AcpxRuntimePort>;
   credential: ManagedCodexCredentialLease | null;
@@ -664,6 +713,61 @@ async function waitForAdmissionCleanupRetry(delayMs: number): Promise<void> {
     const timer = setTimeout(resolve, delayMs);
     timer.unref?.();
   });
+}
+
+function retainRuntimeHostCleanup(cleanup: Promise<unknown>): void {
+  activeRuntimeHostCleanupOwners.add(cleanup);
+  void cleanup.then(
+    () => activeRuntimeHostCleanupOwners.delete(cleanup),
+    () => activeRuntimeHostCleanupOwners.delete(cleanup),
+  );
+}
+
+async function awaitRuntimeHostCleanupWithin(
+  cleanup: Promise<AggregateError | null>,
+  timeoutMs: number,
+): Promise<AggregateError | null | "deferred"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      cleanup,
+      new Promise<"deferred">((resolve) => {
+        timer = setTimeout(
+          () => resolve("deferred"),
+          Math.max(1, Math.floor(timeoutMs)),
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function boundedRuntimeAdmissionVerification(
+  runtime: AcpxRuntimePort,
+  profile: QualifiedAcpxProfile,
+  timeoutMs: number,
+): Promise<AcpxRuntimePortIdentity> {
+  const verification = Promise.resolve().then(async () => {
+    await requireVerifiedAcpxModel(runtime, profile);
+    return await runtime.identity();
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      verification,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new AcpxRuntimeAdmissionTimeoutError()),
+          timeoutMs,
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function boundedCancellation(

@@ -43,7 +43,6 @@ describe("Codex ACPX runtime adapter", () => {
     expect(createRuntime).not.toHaveBeenCalled();
     expect(command.spawn).not.toHaveBeenCalled();
   });
-
   it("opens a persistent Codex session without persisting launch secrets", async () => {
     const runtime = fakeRuntime();
     let runtimeOptions: AcpRuntimeOptions | undefined;
@@ -114,7 +113,10 @@ describe("Codex ACPX runtime adapter", () => {
         options: spawnOptions,
       }),
     ).toBe(child);
-    expect(command.spawn).toHaveBeenCalledWith(["--stdio"], spawnOptions);
+    expect(command.spawn).toHaveBeenCalledWith(["--stdio"], spawnOptions, {
+      credentialFenceFd: 42,
+      activateCredentialFenceOwner: expect.any(Function),
+    });
   });
 
   it("maps status, model selection, and state-preserving close", async () => {
@@ -189,8 +191,9 @@ describe("Codex ACPX runtime adapter", () => {
       // The first exact cleanup remains owned, but it cannot become the retry
       // barrier after its bounded observation and provider termination finish.
       expect(runtime.close).toHaveBeenCalledOnce();
-      await expect(port.close({ reason: "idempotent terminal close" }))
-        .resolves.toBeUndefined();
+      await expect(
+        port.close({ reason: "idempotent terminal close" }),
+      ).resolves.toBeUndefined();
       expect(runtime.close).toHaveBeenCalledTimes(2);
       expect(runtime.close).toHaveBeenLastCalledWith({
         handle: HANDLE,
@@ -242,8 +245,9 @@ describe("Codex ACPX runtime adapter", () => {
       const protocolFailure = new Error("late protocol close failure");
       rejectRuntimeClose(protocolFailure);
       await Promise.resolve();
-      await expect(port.close({ reason: "retry after retained failure" }))
-        .resolves.toBeUndefined();
+      await expect(
+        port.close({ reason: "retry after retained failure" }),
+      ).resolves.toBeUndefined();
       await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(3));
       expect(runtime.close).toHaveBeenLastCalledWith({
         handle: HANDLE,
@@ -292,8 +296,9 @@ describe("Codex ACPX runtime adapter", () => {
       await vi.advanceTimersByTimeAsync(2_000);
       await firstClose;
 
-      await expect(port.close({ reason: "fresh protocol close succeeds" }))
-        .resolves.toBeUndefined();
+      await expect(
+        port.close({ reason: "fresh protocol close succeeds" }),
+      ).resolves.toBeUndefined();
       expect(runtime.close).toHaveBeenCalledTimes(2);
 
       rejectFirstClose(new Error("older protocol close failed late"));
@@ -303,8 +308,9 @@ describe("Codex ACPX runtime adapter", () => {
         reason: "ACPX late protocol cleanup reconciliation 1",
         discardPersistentState: false,
       });
-      await expect(port.close({ reason: "observe reconciled cleanup" }))
-        .resolves.toBeUndefined();
+      await expect(
+        port.close({ reason: "observe reconciled cleanup" }),
+      ).resolves.toBeUndefined();
       expect(runtime.close).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
@@ -368,8 +374,9 @@ describe("Codex ACPX runtime adapter", () => {
         reason: "ACPX late protocol cleanup reconciliation 1",
         discardPersistentState: false,
       });
-      await expect(port.close({ reason: "observe reconciled cleanup" }))
-        .resolves.toBeUndefined();
+      await expect(
+        port.close({ reason: "observe reconciled cleanup" }),
+      ).resolves.toBeUndefined();
       expect(runtime.close).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
@@ -407,8 +414,9 @@ describe("Codex ACPX runtime adapter", () => {
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(2_000);
       await firstClose;
-      await expect(port.close({ reason: "fresh protocol close succeeds" }))
-        .resolves.toBeUndefined();
+      await expect(
+        port.close({ reason: "fresh protocol close succeeds" }),
+      ).resolves.toBeUndefined();
 
       deferred[0]!.reject(new Error("older protocol close failed late"));
       await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(3));
@@ -572,11 +580,176 @@ describe("Codex ACPX runtime adapter", () => {
       });
       await vi.advanceTimersByTimeAsync(0);
       expect(runtime.close).toHaveBeenCalledTimes(4);
-      await expect(port.close({ reason: "observe reconciled cleanup" }))
-        .resolves.toBeUndefined();
+      await expect(
+        port.close({ reason: "observe reconciled cleanup" }),
+      ).resolves.toBeUndefined();
       expect(runtime.close).toHaveBeenCalledTimes(4);
     } finally {
       releaseOwnerFinalizer?.();
+      vi.useRealTimers();
+    }
+  });
+
+  it("kills a TERM-resistant provider through its live guardian", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      const child = childThatExitsOnKill();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      const closing = expect(
+        port.close({ reason: "provider ignored shutdown" }),
+      ).rejects.toMatchObject({
+        errors: [
+          expect.objectContaining({
+            message: "ACPX provider did not exit after SIGTERM",
+          }),
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(4_000);
+      await closing;
+
+      expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+      expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+      expect(child.kill).toHaveBeenCalledTimes(2);
+      expect(child.signalCode).toBe("SIGKILL");
+      // Cleanup never transfers a copied numeric PGID or releases local
+      // ownership before the verified guardian's exit is observed.
+      expect(child.unref).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains local ownership when guardian group exit cannot be confirmed", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      const child = stubbornChild();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      const closing = expect(
+        port.close({ reason: "provider group exit unconfirmed" }),
+      ).rejects.toMatchObject({
+        errors: expect.arrayContaining([
+          expect.objectContaining({
+            message: "ACPX provider did not exit after SIGKILL",
+          }),
+        ]),
+      });
+      await vi.advanceTimersByTimeAsync(4_000);
+      await closing;
+
+      expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
+      expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+      expect(child.unref).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects Windows before runtime construction or provider spawn", async () => {
+    const command = fakeCommand();
+    const createRuntime = vi.fn(() => fakeRuntime());
+
+    await expect(
+      openCodexAcpxRuntime(openOptions(command), {
+        platform: "win32",
+        createRuntime,
+      }),
+    ).rejects.toThrow(
+      "The production ACPX runtime is unavailable on Windows because verified provider launch requires atomic no-follow file opening",
+    );
+
+    expect(createRuntime).not.toHaveBeenCalled();
+    expect(command.spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects and independently cleans providers spawned during termination", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      const firstChild = childThatExitsOnKill();
+      const lateChild = childThatExitsOnKill();
+      const command = fakeCommand();
+      vi.mocked(command.spawn)
+        .mockReturnValueOnce(firstChild)
+        .mockReturnValueOnce(lateChild);
+      const retainedCleanups: Promise<void>[] = [];
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        retainCleanup: (cleanup) => retainedCleanups.push(cleanup),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      let settled = false;
+      const closing = port.close({ reason: "join late provider" }).then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(firstChild.kill).toHaveBeenCalledWith("SIGTERM");
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(() =>
+        runtimeOptions?.spawnAgent?.({
+          command: "ignored",
+          args: ["--stdio"],
+          options: {},
+        }),
+      ).toThrow("provider spawned after cleanup was sealed");
+      expect(lateChild.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(retainedCleanups).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(firstChild.kill).toHaveBeenCalledWith("SIGKILL");
+      await closing;
+      await retainedCleanups[0];
+      expect(settled).toBe(true);
+    } finally {
       vi.useRealTimers();
     }
   });
@@ -717,6 +890,43 @@ describe("Codex ACPX runtime adapter", () => {
       reason: "ACPX runtime identity validation failed",
       discardPersistentState: false,
     });
+  });
+
+  it("bounds invalid-identity cleanup before terminating the provider", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime({ ...HANDLE, agentSessionId: undefined });
+      vi.mocked(runtime.close).mockImplementation(
+        () => new Promise<void>(() => undefined),
+      );
+      const child = fakeChild();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      const opening = openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => ({
+          ...runtime,
+          ensureSession: vi.fn(async () => {
+            options.spawnAgent?.({
+              command: "ignored",
+              args: ["--stdio"],
+              options: {},
+            });
+            return { ...HANDLE, agentSessionId: undefined };
+          }),
+        }),
+      });
+      const rejected = expect(opening).rejects.toThrow(
+        "identity validation and cleanup failed",
+      );
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await rejected;
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("terminates a provider spawned before the session handshake rejects", async () => {
@@ -925,7 +1135,11 @@ describe("Codex ACPX runtime adapter", () => {
     await expect(result).rejects.toMatchObject({
       errors: [
         handshakeError,
-        ...child.errors,
+        child.errors[0],
+        expect.objectContaining({
+          message: "ACPX provider did not exit after SIGTERM",
+        }),
+        child.errors[1],
         expect.objectContaining({
           message: "ACPX provider did not exit after SIGKILL",
         }),
@@ -933,6 +1147,7 @@ describe("Codex ACPX runtime adapter", () => {
     });
     expect(child.child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
     expect(child.child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    expect(child.child.kill).toHaveBeenCalledTimes(2);
   });
 
   it("closes a recovered session when its handshake rejects before another save", async () => {
@@ -1086,6 +1301,67 @@ describe("Codex ACPX runtime adapter", () => {
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
+  it("waits for a timed-out admission close before retrying it sequentially", async () => {
+    let rejectFirstClose!: (error: Error) => void;
+    const firstClose = new Promise<void>((_resolve, reject) => {
+      rejectFirstClose = reject;
+    });
+    const runtime = fakeRuntime();
+    vi.mocked(runtime.close)
+      .mockImplementationOnce(() => firstClose)
+      .mockResolvedValueOnce(undefined);
+    const retainedCleanups: Promise<void>[] = [];
+
+    await expect(
+      openCodexAcpxRuntime(openOptions(fakeCommand()), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        runtimeCloseTimeoutMs: 1,
+        retainCleanup: (cleanup) => retainedCleanups.push(cleanup),
+        createRuntime: (runtimeOptions) => {
+          vi.mocked(runtime.ensureSession).mockImplementation(async () => {
+            await runtimeOptions.sessionStore.save({
+              acpxRecordId: "retry-record",
+              acpSessionId: "retry-backend-session",
+              agentSessionId: "retry-agent-session",
+              name: "retry-runtime-name",
+              cwd: "/workspace",
+            } as never);
+            throw new Error("handshake failed before cleanup retry");
+          });
+          return runtime;
+        },
+      }),
+    ).rejects.toThrow("session handshake and runtime cleanup failed");
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(runtime.close).toHaveBeenCalledOnce();
+    rejectFirstClose(new Error("late first close failure"));
+
+    for (let turn = 0; turn < 5 && retainedCleanups.length < 2; turn += 1) {
+      await Promise.resolve();
+    }
+    expect(retainedCleanups.length).toBeGreaterThan(1);
+    let recoverySettled = false;
+    void retainedCleanups.at(-1)!.then(() => {
+      recoverySettled = true;
+    });
+    await Promise.resolve();
+    expect(recoverySettled).toBe(false);
+
+    await vi.waitFor(() => expect(runtime.close).toHaveBeenCalledTimes(2));
+    await expect(Promise.all(retainedCleanups)).resolves.toBeDefined();
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(runtime.close).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        reason: "ACPX session handshake failed",
+        discardPersistentState: false,
+      }),
+    );
+  });
+
   it("rejects close with asynchronous provider signal errors", async () => {
     const runtime = fakeRuntime();
     const command = fakeCommand();
@@ -1109,7 +1385,11 @@ describe("Codex ACPX runtime adapter", () => {
     await expect(port.close({ reason: "test complete" })).rejects.toMatchObject(
       {
         errors: [
-          ...child.errors,
+          child.errors[0],
+          expect.objectContaining({
+            message: "ACPX provider did not exit after SIGTERM",
+          }),
+          child.errors[1],
           expect.objectContaining({
             message: "ACPX provider did not exit after SIGKILL",
           }),
@@ -1118,6 +1398,7 @@ describe("Codex ACPX runtime adapter", () => {
     );
     expect(child.child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
     expect(child.child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+    expect(child.child.kill).toHaveBeenCalledTimes(2);
   });
 
   it("retains a provider error after close removes the child", async () => {
@@ -1150,6 +1431,99 @@ describe("Codex ACPX runtime adapter", () => {
       },
     );
     expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("bounds a stalled session handshake and terminates its provider", async () => {
+    const child = fakeChild();
+    const command = fakeCommand();
+    vi.mocked(command.spawn).mockReturnValue(child);
+    const runtime = fakeRuntime();
+
+    await expect(
+      openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        sessionHandshakeTimeoutMs: 1,
+        createRuntime: (options) => {
+          vi.mocked(runtime.ensureSession).mockImplementation(() => {
+            options.spawnAgent?.({
+              command: "ignored",
+              args: ["--stdio"],
+              options: {},
+            });
+            return new Promise<AcpRuntimeHandle>(() => undefined);
+          });
+          return runtime;
+        },
+      }),
+    ).rejects.toThrow("session handshake exceeded its admission deadline");
+    expect(runtime.close).not.toHaveBeenCalled();
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("rejects provider children created after handshake cleanup is sealed", async () => {
+    const child = fakeChild();
+    const postCleanupChild = fakeChild();
+    const command = fakeCommand();
+    vi.mocked(command.spawn)
+      .mockReturnValueOnce(child)
+      .mockReturnValueOnce(postCleanupChild);
+    const runtime = fakeRuntime();
+    const retainCleanup = vi.fn<(cleanup: Promise<void>) => void>();
+    let runtimeOptions: AcpRuntimeOptions | undefined;
+    let resolveHandshake: ((handle: AcpRuntimeHandle) => void) | undefined;
+    vi.mocked(runtime.ensureSession).mockImplementation(
+      () =>
+        new Promise<AcpRuntimeHandle>((resolve) => {
+          resolveHandshake = resolve;
+        }),
+    );
+
+    await expect(
+      openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        sessionHandshakeTimeoutMs: 1,
+        retainCleanup,
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      }),
+    ).rejects.toThrow("session handshake exceeded its admission deadline");
+
+    expect(retainCleanup).toHaveBeenCalledOnce();
+    const retainedCleanup = retainCleanup.mock.calls[0]?.[0];
+    expect(retainedCleanup).toBeDefined();
+
+    expect(() =>
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      }),
+    ).toThrow("provider spawned after cleanup was sealed");
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(retainCleanup).toHaveBeenCalledTimes(2);
+    await retainCleanup.mock.calls[1]?.[0];
+    resolveHandshake?.(HANDLE);
+
+    await retainedCleanup;
+    expect(runtime.close).toHaveBeenCalledWith({
+      handle: HANDLE,
+      reason: "ACPX session handshake completed after its admission deadline",
+      discardPersistentState: false,
+    });
+    expect(() =>
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      }),
+    ).toThrow("provider spawned after cleanup was sealed");
+    expect(postCleanupChild.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(retainCleanup).toHaveBeenCalledTimes(3);
+    await retainCleanup.mock.calls[2]?.[0];
   });
 
   it("rejects non-Codex profiles before constructing ACPX", async () => {
@@ -1204,6 +1578,10 @@ function openOptions(
       OPENAI_API_KEY: "credential-secret",
       OMITTED: undefined,
     },
+    // Fake command leases do not inherit this descriptor; production host
+    // supplies the live credential-listener descriptor.
+    credentialFenceFd: 42,
+    activateCredentialFenceOwner: async () => undefined,
     systemInstructions: "Use Paperclip tools.",
     mcpServers: [],
   };
@@ -1257,7 +1635,41 @@ function failingSignalChild(): {
     queueMicrotask(() => child.emit("error", error));
     return true;
   });
+  child.unref = vi.fn(() => child);
   return { child, errors };
+}
+
+function stubbornChild(): ChildProcess {
+  const child = new EventEmitter() as ChildProcess;
+  Object.defineProperties(child, {
+    pid: { value: 71_001 },
+    exitCode: { value: null, writable: true },
+    signalCode: { value: null, writable: true },
+    stdin: { value: { destroy: vi.fn() } },
+    stdout: { value: { destroy: vi.fn() } },
+    stderr: { value: { destroy: vi.fn() } },
+  });
+  child.kill = vi.fn(() => true);
+  child.unref = vi.fn(() => child);
+  return child;
+}
+
+function childThatExitsOnKill(): ChildProcess {
+  const child = new EventEmitter() as ChildProcess;
+  Object.defineProperties(child, {
+    pid: { value: 71_002 },
+    exitCode: { value: null, writable: true },
+    signalCode: { value: null, writable: true },
+  });
+  child.kill = vi.fn((signal?: NodeJS.Signals | number) => {
+    if (signal === "SIGKILL") {
+      child.signalCode = "SIGKILL";
+      queueMicrotask(() => child.emit("exit", null, "SIGKILL"));
+    }
+    return true;
+  });
+  child.unref = vi.fn(() => child);
+  return child;
 }
 
 function registry(): AcpAgentRegistry {

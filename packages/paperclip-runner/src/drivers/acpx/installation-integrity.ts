@@ -22,7 +22,7 @@ import {
   relative,
   resolve,
 } from "node:path";
-import type { Writable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 
 import type { QualifiedAcpxProfile } from "./qualified-profiles.js";
 
@@ -32,6 +32,79 @@ const COMMAND_SOURCE_FD = 3;
 const COMMAND_DIRECTORY_FD = 4;
 const DEPENDENCY_ANCESTOR_FD_START = 5;
 const MAX_DEPENDENCY_ANCESTORS = 64;
+const PROVIDER_GUARDIAN_HANDSHAKE_TIMEOUT_MS = 1_000;
+
+export const PROVIDER_LIFETIME_GUARDIAN_SOURCE = `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const dependencyAncestorCount = Number.parseInt(process.argv[4], 10);
+if (!Number.isSafeInteger(dependencyAncestorCount) || dependencyAncestorCount < 1 || dependencyAncestorCount > ${MAX_DEPENDENCY_ANCESTORS}) throw new Error("ACPX provider dependency ancestry is invalid");
+const OWNER_FD = ${DEPENDENCY_ANCESTOR_FD_START} + dependencyAncestorCount;
+const OWNERSHIP_FD = OWNER_FD + 1;
+const CREDENTIAL_FENCE_FD = OWNERSHIP_FD + 1;
+const dependencyAncestorFds = Array.from({ length: dependencyAncestorCount }, (_, index) => ${DEPENDENCY_ANCESTOR_FD_START} + index);
+const PROVIDER_GUARDIAN_FD = ${DEPENDENCY_ANCESTOR_FD_START} + dependencyAncestorCount;
+let provider;
+let reaped = false;
+let shutdownStarted = false;
+const reap = () => {
+  if (reaped) return;
+  reaped = true;
+  // This sentinel is the provider group's leader. It remains alive until this
+  // one atomic signal, pinning the numeric group identity against PID reuse.
+  process.kill(-process.pid, "SIGKILL");
+};
+const owner = fs.createReadStream("", { fd: OWNER_FD, autoClose: false });
+owner.once("end", reap);
+owner.once("error", reap);
+owner.resume();
+// Fail before provider code exists unless the inherited kernel fence is live.
+fs.fstatSync(CREDENTIAL_FENCE_FD);
+const shutdown = () => {
+  if (shutdownStarted || reaped) return;
+  shutdownStarted = true;
+  try {
+    provider?.kill("SIGTERM");
+  } catch {
+    reap();
+    return;
+  }
+  setTimeout(reap, 1_000);
+};
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+process.on("SIGHUP", shutdown);
+try {
+  provider = spawn(
+    process.execPath,
+    ["--eval", process.argv[1], ...process.argv.slice(2)],
+    {
+      cwd: process.cwd(),
+      detached: false,
+      env: process.env,
+      shell: false,
+      // The provider observes this guardian-owned pipe directly. Kernel EOF
+      // therefore revokes it even when SIGKILL/OOM prevents our JS reap path.
+      // It also inherits the credential fence until that self-reap completes.
+      stdio: [0, 1, 2, ${COMMAND_SOURCE_FD}, ${COMMAND_DIRECTORY_FD}, ...dependencyAncestorFds, "pipe", CREDENTIAL_FENCE_FD],
+      windowsHide: true,
+    },
+  );
+  provider.once("error", reap);
+  provider.once("exit", reap);
+  provider.once("spawn", () => {
+    try {
+      fs.writeSync(OWNERSHIP_FD, "owned\\n");
+    } catch {
+      reap();
+    }
+  });
+} catch {
+  reap();
+}
+`;
+
+const providerGuardianOwnership = new WeakMap<ChildProcess, Promise<void>>();
 
 export type AcpxPackageJsonResolver = (packageName: string) => string;
 
@@ -46,8 +119,56 @@ export interface VerifiedAcpxCommandLease {
   spawn(
     args?: readonly string[],
     options?: SpawnOptionsWithoutStdio,
+    lifetime?: VerifiedAcpxProviderLifetime,
   ): ChildProcess;
   close(): Promise<void>;
+}
+
+export interface VerifiedAcpxProviderLifetime {
+  /** Listening socket that fences the canonical Codex credential home. */
+  credentialFenceFd: number;
+  /** Persist the guardian PID before provider admission can succeed. */
+  activateCredentialFenceOwner(pid: number): Promise<void>;
+}
+
+/** Fail closed where verified provider-group ownership cannot be guaranteed. */
+export function assertVerifiedAcpxProviderPlatform(
+  platform: NodeJS.Platform,
+): void {
+  if (platform === "win32") {
+    throw new Error(
+      "The production ACPX runtime is unavailable on Windows because verified provider launch requires atomic no-follow file opening",
+    );
+  }
+}
+
+/** Reap only the group the live provider belongs to at signal-delivery time. */
+export function reapCurrentProviderProcessGroup(
+  kill: (pid: number, signal: NodeJS.Signals) => unknown,
+  currentPid: number,
+  exit: (code: number) => unknown,
+): void {
+  try {
+    // POSIX pid zero names the caller's current process group. Unlike a saved
+    // guardian PGID, the kernel resolves this ownership at the instant of the
+    // signal, so a dead guardian's recycled identifier can never be targeted.
+    kill(0, "SIGKILL");
+  } catch {
+    try {
+      // The caller's own live PID cannot be recycled out from under it. This
+      // fallback still revokes the provider if whole-group signaling fails.
+      kill(currentPid, "SIGKILL");
+    } catch {
+      exit(1);
+    }
+  }
+}
+
+/** Wait until the verified wrapper has armed owner-death and credential fencing. */
+export async function awaitVerifiedAcpxProviderOwnership(
+  child: ChildProcess,
+): Promise<void> {
+  await (providerGuardianOwnership.get(child) ?? Promise.resolve());
 }
 
 interface VerifiedAcpxCommandIdentity {
@@ -72,6 +193,8 @@ type AcpxCommandFormat = "commonjs" | "module";
 
 const COMMONJS_SNAPSHOT_BOOTSTRAP = snapshotBootstrap("commonjs");
 const MODULE_SNAPSHOT_BOOTSTRAP = snapshotBootstrap("module");
+const GUARDED_COMMONJS_SNAPSHOT_BOOTSTRAP = snapshotBootstrap("commonjs", true);
+const GUARDED_MODULE_SNAPSHOT_BOOTSTRAP = snapshotBootstrap("module", true);
 
 /** Resolve and verify every installed artifact bound by a qualified profile. */
 export async function verifyQualifiedAcpxInstallation(
@@ -503,40 +626,101 @@ function commandLease(
     spawn(
       args: readonly string[] = [],
       options: SpawnOptionsWithoutStdio = {},
+      lifetime?: VerifiedAcpxProviderLifetime,
     ): ChildProcess {
       if (consumed) throw new Error("Verified ACPX command lease is closed");
       consumed = true;
       let child: ChildProcess;
       try {
+        const guarded = lifetime !== undefined;
+        if (guarded) assertVerifiedAcpxProviderPlatform(process.platform);
+        const providerBootstrap = guarded
+          ? format === "module"
+            ? GUARDED_MODULE_SNAPSHOT_BOOTSTRAP
+            : GUARDED_COMMONJS_SNAPSHOT_BOOTSTRAP
+          : format === "module"
+            ? MODULE_SNAPSHOT_BOOTSTRAP
+            : COMMONJS_SNAPSHOT_BOOTSTRAP;
+        const providerOwnershipFd =
+          DEPENDENCY_ANCESTOR_FD_START + dependencyAncestors.length + 1;
+        if (
+          guarded &&
+          (!Number.isSafeInteger(lifetime.credentialFenceFd) ||
+            lifetime.credentialFenceFd < 0 ||
+            typeof lifetime.activateCredentialFenceOwner !== "function")
+        ) {
+          throw new Error("ACPX provider credential fence is invalid");
+        }
         child = spawnChildProcess(
           process.execPath,
-          [
-            // Keep resolved module URLs on the retained descriptor paths so
-            // the hook can distinguish them from ordinary host ancestry.
-            "--preserve-symlinks",
-            "--eval",
-            format === "module"
-              ? MODULE_SNAPSHOT_BOOTSTRAP
-              : COMMONJS_SNAPSHOT_BOOTSTRAP,
-            commandDirectoryPath,
-            commandName,
-            String(dependencyAncestors.length),
-            ...args,
-          ],
+          guarded
+            ? [
+                // Keep resolved module URLs on the retained descriptor paths
+                // so the hook can distinguish them from host ancestry.
+                "--preserve-symlinks",
+                "--eval",
+                PROVIDER_LIFETIME_GUARDIAN_SOURCE,
+                providerBootstrap,
+                commandDirectoryPath,
+                commandName,
+                String(dependencyAncestors.length),
+                ...args,
+              ]
+            : [
+                "--preserve-symlinks",
+                "--eval",
+                providerBootstrap,
+                commandDirectoryPath,
+                commandName,
+                String(dependencyAncestors.length),
+                ...args,
+              ],
           {
             ...options,
+            // In production this process is a persistent sentinel and group
+            // leader. It arms owner-death before spawning provider code, keeps
+            // the credential listener inherited, and pins the PGID until its
+            // single whole-group reap.
+            detached: process.platform !== "win32",
             env: sanitizedNodeEnvironment(options.env),
             shell: false,
-            stdio: [
-              "pipe",
-              "pipe",
-              "pipe",
-              "pipe",
-              commandDirectory.fd,
-              ...dependencyAncestors.map((handle) => handle.fd),
-            ],
+            stdio: guarded
+              ? [
+                  "pipe",
+                  "pipe",
+                  "pipe",
+                  "pipe",
+                  commandDirectory.fd,
+                  ...dependencyAncestors.map((handle) => handle.fd),
+                  "pipe",
+                  "pipe",
+                  lifetime.credentialFenceFd,
+                ]
+              : [
+                  "pipe",
+                  "pipe",
+                  "pipe",
+                  "pipe",
+                  commandDirectory.fd,
+                  ...dependencyAncestors.map((handle) => handle.fd),
+                ],
           },
         );
+        if (guarded) {
+          protectProviderGroupKill(child);
+          const guardianPid = child.pid!;
+          const ownership = Promise.all([
+            providerOwnershipHandshake(child, providerOwnershipFd),
+            Promise.resolve().then(() =>
+              lifetime.activateCredentialFenceOwner(guardianPid),
+            ),
+          ]).then(() => undefined);
+          // Session construction can reject before the adapter reaches its
+          // explicit ownership await. Observe that early rejection now while
+          // preserving it for the admission boundary.
+          void ownership.catch(() => undefined);
+          providerGuardianOwnership.set(child, ownership);
+        }
       } catch (error) {
         verifiedBytes.fill(0);
         releaseDirectoriesBestEffort();
@@ -560,6 +744,87 @@ function commandLease(
   };
 }
 
+function protectProviderGroupKill(child: ChildProcess): void {
+  const processGroupId = child.pid;
+  if (!Number.isSafeInteger(processGroupId) || (processGroupId ?? 0) <= 0) {
+    throw new Error(
+      "ACPX provider lifetime guardian omitted its group identity",
+    );
+  }
+  const signalGuardian = child.kill.bind(child);
+  let groupReaped = false;
+  child.kill = (signal?: NodeJS.Signals | number): boolean => {
+    if (signal !== "SIGKILL" && signal !== 9) {
+      return signalGuardian(signal);
+    }
+    if (groupReaped) return false;
+    try {
+      // The live sentinel pins this PGID. ACPX may request an emergency KILL,
+      // but it must never kill only the fence owner or signal a reused group.
+      process.kill(-(processGroupId as number), "SIGKILL");
+      groupReaped = true;
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        groupReaped = true;
+        return false;
+      }
+      throw error;
+    }
+  };
+}
+
+function providerOwnershipHandshake(
+  child: ChildProcess,
+  ownershipFd: number,
+): Promise<void> {
+  const output = (child.stdio as Array<Readable | Writable | null | undefined>)[
+    ownershipFd
+  ] as Readable | null | undefined;
+  if (output == null) {
+    return Promise.reject(
+      new Error("ACPX provider lifetime guardian omitted its ownership pipe"),
+    );
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let buffered = "";
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("error", onError);
+      child.off("close", onClose);
+      output.off("data", onData);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (): void =>
+      finish(new Error("ACPX provider lifetime guardian failed to start"));
+    const onClose = (): void =>
+      finish(
+        new Error(
+          "ACPX provider lifetime guardian exited before ownership transfer",
+        ),
+      );
+    const onData = (chunk: Buffer | string): void => {
+      buffered += chunk.toString();
+      if (buffered.includes("owned\n")) finish();
+    };
+    const timer = setTimeout(
+      () =>
+        finish(
+          new Error("ACPX provider lifetime guardian ownership timed out"),
+        ),
+      PROVIDER_GUARDIAN_HANDSHAKE_TIMEOUT_MS,
+    );
+    timer.unref();
+    child.once("error", onError);
+    child.once("close", onClose);
+    output.on("data", onData);
+  });
+}
+
 export function sanitizedNodeEnvironment(
   environment: NodeJS.ProcessEnv | undefined,
 ): NodeJS.ProcessEnv {
@@ -576,7 +841,7 @@ export function sanitizedNodeEnvironment(
   return sanitized;
 }
 
-function snapshotBootstrap(format: AcpxCommandFormat): string {
+function snapshotBootstrap(format: AcpxCommandFormat, guarded = false): string {
   return [
     'const fs = require("node:fs");',
     'const { isBuiltin, registerHooks } = require("node:module");',
@@ -586,6 +851,22 @@ function snapshotBootstrap(format: AcpxCommandFormat): string {
     "const commandName = process.argv[2];",
     "const dependencyAncestorCount = Number.parseInt(process.argv[3], 10);",
     `if (!Number.isSafeInteger(dependencyAncestorCount) || dependencyAncestorCount < 1 || dependencyAncestorCount > ${MAX_DEPENDENCY_ANCESTORS}) throw new Error("ACPX provider dependency ancestry is invalid");`,
+    ...(guarded
+      ? [
+          `const guardianFd = ${DEPENDENCY_ANCESTOR_FD_START} + dependencyAncestorCount;`,
+          'const guardian = fs.createReadStream("", { fd: guardianFd, autoClose: false });',
+          `const reapCurrentProviderProcessGroup = ${reapCurrentProviderProcessGroup.toString()};`,
+          "const killProviderProcess = process.kill.bind(process);",
+          "const providerProcessId = process.pid;",
+          "const exitProviderProcess = process.exit.bind(process);",
+          "let guardianLost = false;",
+          "const reapOnGuardianLoss = () => { if (guardianLost) return; guardianLost = true; reapCurrentProviderProcessGroup(killProviderProcess, providerProcessId, exitProviderProcess); };",
+          'guardian.once("end", reapOnGuardianLoss);',
+          'guardian.once("error", reapOnGuardianLoss);',
+          "guardian.resume();",
+          "fs.fstatSync(guardianFd + 1);",
+        ]
+      : []),
     "const commandPath = resolve(commandDirectory, commandName);",
     "process.argv.splice(1, 3, commandPath);",
     `const guardSnapshotModuleLookup = ${guardSnapshotModuleLookup.toString()};`,
