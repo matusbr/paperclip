@@ -580,7 +580,7 @@ impl AcpxProviderSession {
             )));
         }
         self.closed = true;
-        self.transport.shutdown()?;
+        self.terminate_transport()?;
         Ok(identity)
     }
 
