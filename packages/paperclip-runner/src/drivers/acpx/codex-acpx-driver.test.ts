@@ -102,7 +102,7 @@ describe("Codex ACPX harness driver", () => {
       workingDirectory: "/workspace",
     })).rejects.toThrow(
       "Codex ACPX host returned a different session identity",
-    });
+    );
     await vi.waitFor(() => expect(fixture.host.close).toHaveBeenCalledTimes(2));
 
     const nextAdmission = fixture.driver.openSession({
