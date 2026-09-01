@@ -178,4 +178,35 @@ describe("redactCommandText", () => {
     expect(output).not.toContain("private");
     expect(output).toBe(`TOKEN="${REDACTED_COMMAND_TEXT_VALUE}" safe`);
   });
+
+  it("cannot decide a literal backslash immediately followed by a quote, and keeps the JSON-safe reading", () => {
+    // greptile-apps P1, second round on PR #12530: with the lookahead in
+    // place, a value whose literal backslash is immediately followed by a
+    // quote (`abc\"def`) still leaves the suffix visible. That is not an
+    // oversight in the character class, it is undecidable at this layer: the
+    // two inputs below contain the identical byte sequence `Bearer abc\"`,
+    // and the correct boundary differs between them. Consuming `\"` would
+    // restore the truncation bug from #11037 for every JSON-serialized log
+    // line in order to protect a shape that only occurs when a raw command
+    // embeds an escaped quote inside an unquoted token. Redacting before
+    // serialization is the layer that can tell the two apart; #11037 leaves
+    // that choice with the maintainers. Both readings are pinned here so a
+    // later change to this class has to state which one it picks.
+    const serialized = JSON.stringify({ command: 'curl -H "Authorization: Bearer abc"' });
+    const raw = String.raw`curl -H Authorization: Bearer abc\"def`;
+    expect(serialized).toContain(String.raw`Bearer abc\"`);
+    expect(raw).toContain(String.raw`Bearer abc\"`);
+
+    // Serialized reading: the boundary is correct, the secret is gone, the
+    // line stays parseable.
+    const serializedOutput = redactCommandText(serialized);
+    expect(serializedOutput).not.toContain("abc");
+    expect(() => JSON.parse(serializedOutput)).not.toThrow();
+
+    // Raw reading: the same boundary leaves `\"def` behind. Documented, not
+    // claimed as fixed.
+    expect(redactCommandText(raw)).toBe(
+      `curl -H Authorization: Bearer ${REDACTED_COMMAND_TEXT_VALUE}\\"def`,
+    );
+  });
 });
